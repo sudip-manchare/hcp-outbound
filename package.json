@@ -1,0 +1,15 @@
+{
+  "name": "hcp-outbound",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CMS Open Payments Audit & Defense Guard - HCP Outbound Engagement Engine",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "start": "npm --prefix frontend run start",
+    "test": "npm --prefix frontend test",
+    "test:watch": "npm --prefix frontend run test:watch",
+    "test:e2e": "npm --prefix frontend run test:e2e",
+    "type-check": "npm --prefix frontend run type-check"
+  }
+}
