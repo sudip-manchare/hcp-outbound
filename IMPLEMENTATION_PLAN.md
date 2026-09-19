@@ -13,9 +13,9 @@ Under the federal Sunshine Act, pharmaceutical and medical device companies must
 While Impiricus currently facilitates clinical requests (samples, dosing info) to already-engaged physicians, cold outbound to doctors has historically suffered from sub-2% conversion rates.
 **Our Invention: The AI Sunshine Dispute Advocate & Reverse Engagement Loop:**
 1. **Live CMS NPPES NPI Registry Enrichment**: Open Payments data gives raw NPIs and payment amounts. Our engine queries the official CMS NPPES REST API (`https://npiregistry.cms.hhs.gov/api/`) in real time to resolve the physician's legal name, credential (MD, DO), official clinical taxonomy (primary specialty), and practice location.
-2. **High-Urgency Outbound**: An automated SMS alerts the doctor of unreviewed transactions and specialty-mismatched entries under their NPI with a 1-click secure link.
-3. **Zero-Login Mobile Audit Card**: A mobile web card showing total dollars, meal count, reporting manufacturers, and unreviewed entries flagged by pgvector & TimescaleDB.
-4. **AI Sunshine Dispute Advocate (42 CFR § 403.908)**: Tapping "Dispute Unreviewed Items" triggers a 4-digit SMS OTP. Upon verification, the engine auto-generates a formal federal dispute notice directed to the manufacturer's compliance contact.
+2. **High-Urgency Outbound Dispatch**: The outbound engine generates targeted physician alerts regarding unreviewed transactions and specialty-mismatched entries under their NPI, providing a secure, 1-click audit portal link.
+3. **Zero-Login Physician Audit Portal**: A dedicated web-based audit dashboard showing total dollars, meal count, reporting manufacturers, and flagged entries surfaced by pgvector & TimescaleDB.
+4. **AI Sunshine Dispute Advocate (42 CFR § 403.908)**: With a single click ("Dispute Unreviewed Items"), the physician reviews flagged anomalies and auto-generates a formal federal dispute notice directed to the manufacturer's compliance contact.
 5. **The Reverse Engagement Flip**: Impiricus acts as the permanent concierge shield. The pharma manufacturer corrects the entry and opens a compliant, trusted digital channel with a previously unreachable doctor.
 
 ---
@@ -30,29 +30,29 @@ While Impiricus currently facilitates clinical requests (samples, dosing info) t
                                                   ^
                                                   | Live NPI Enrichment
                                                   v
-+-------------------------------------------------+---------------------------+
-|                      Presenter Split-Screen Web App (Next.js)               |
++-----------------------------------------------------------------------------+
+|                      HCP Outbound Web Application (Next.js)                 |
 |                                                                             |
-|  [Left: Campaign Console & HCP Roster]      [Right: Live Mobile Phone View] |
-|   - Doctor Directory with Live NPI Search    - Simulated / Real SMS Alert   |
-|   - NPPES Verified Badges & Taxonomy         - Zero-Login Audit Card        |
-|   - Anomaly / Mismatch Risk Indicators       - 1-Tap Dispute & OTP Auth     |
-|   - "Send Alert SMS" Demo Trigger            - AI 42 CFR § 403.908 Notice   |
-|   - Live Pipeline Analytics                  - Concierge Claim Confirmation |
-+------------------------------------+----------------------------------------+
-                                     | API calls (REST / SSE)
-                                     v
+|  [Campaign Command Console & HCP Roster]   [Physician Audit & Dispute Portal]
+|   - Doctor Directory with Live NPI Search   - Zero-Login Tokenized Audit View|
+|   - NPPES Verified Badges & Taxonomy        - Financial & Velocity Breakdown|
+|   - Anomaly / Mismatch Risk Indicators      - Out-of-Specialty Anomaly Flags |
+|   - Outbound Alert Dispatcher               - 1-Click AI Dispute Notice Gen |
+|   - Live Pipeline Analytics & Conversion    - Concierge Shield Confirmation |
++-------------------------------------+---------------------------------------+
+                                      | API calls (REST / SSE)
+                                      v
 +-----------------------------------------------------------------------------+
 |                        Python FastAPI Backend                               |
 |   - NPPES Service (Live CMS NPI Registry REST queries & taxonomy parsing)   |
 |   - CMS Data Seed & Ingestion Engine                                        |
 |   - TimescaleDB Time-Series Velocity Analytics (`time_bucket`)              |
 |   - pgvector Semantic Mismatch Scorer (`cosine_distance`)                   |
-|   - Twilio Outbound SMS & OTP Verification Service                          |
+|   - Campaign & Outbound Token Dispatch Service                              |
 |   - AI Sunshine Dispute Notice Generator (42 CFR § 403.908)                |
-+------------------------------------+----------------------------------------+
-                                     |
-                                     v
++-------------------------------------+---------------------------------------+
+                                      |
+                                      v
 +-----------------------------------------------------------------------------+
 |               Tiger Data Managed PostgreSQL (Postgres 16+)                  |
 |                                                                             |
@@ -68,7 +68,7 @@ While Impiricus currently facilitates clinical requests (samples, dosing info) t
 ### Winning "Best Use of Tiger Data"
 - **TimescaleDB**:
   - `cms_payments` is registered as a TimescaleDB hypertable (`create_hypertable('cms_payments', 'payment_date')`).
-  - Time-series analytics via `time_bucket('1 month', payment_date)` detect sudden velocity spikes (e.g., sales reps logging 4 consecutive meals in December before reporting deadlines).
+  - Time-series analytics via `time_bucket('1 month', payment_date)` detect sudden velocity spikes (e.g., sales reps logging multiple consecutive meals in December before reporting deadlines).
 - **pgvector**:
   - Physician clinical taxonomies (from NPPES) and pharma product/study descriptions are vectorized.
   - Anomaly scoring via `<=>` (cosine distance): e.g., an Orthopedic Spine system payment logged against an Interventional Cardiologist triggers a high Specialty Mismatch Score (>0.85), proving algorithmic fraud detection.
@@ -83,9 +83,8 @@ hcp-outbound/
 ├── backend/
 │   ├── app/
 │   │   ├── api/
-│   │   │   ├── campaign.py       # SMS trigger & batch management
+│   │   │   ├── campaign.py       # Outbound alert dispatch & pipeline management
 │   │   │   ├── doctors.py        # HCP directory, live NPI search, audit card
-│   │   │   ├── auth.py           # OTP send & verify
 │   │   │   └── dispute.py        # AI Sunshine Dispute Notice generator
 │   │   ├── core/
 │   │   │   ├── config.py         # Settings & env vars
@@ -96,7 +95,7 @@ hcp-outbound/
 │   │   │   ├── nppes_service.py     # Live CMS NPPES Registry API enrichment
 │   │   │   ├── timescale_service.py # Time-bucket velocity queries
 │   │   │   ├── vector_service.py    # pgvector embeddings & cosine scoring
-│   │   │   └── twilio_service.py    # Twilio SMS & OTP handling (with demo simulator)
+│   │   │   └── campaign_service.py  # Secure audit token generation & outreach dispatch
 │   │   └── main.py               # FastAPI application entrypoint
 │   ├── scripts/
 │   │   ├── init_tiger_db.py      # Extension activation, hypertable setup, tables
@@ -106,15 +105,17 @@ hcp-outbound/
 ├── frontend/
 │   ├── src/
 │   │   ├── app/
-│   │   │   ├── page.tsx          # Split-screen presentation view
-│   │   │   ├── audit/[token]/    # Standalone mobile route for actual phone clicks
+│   │   │   ├── page.tsx          # Campaign Command Center & Integrated Audit Workspace
+│   │   │   ├── audit/[token]/    # Physician Audit & Dispute Portal route
 │   │   │   └── layout.tsx
 │   │   ├── components/
-│   │   │   ├── CampaignConsole.tsx   # Left-side campaign manager & HCP roster
-│   │   │   ├── PhoneEmulator.tsx     # Right-side interactive iPhone frame
-│   │   │   ├── AuditCard.tsx         # Mobile Audit Card component
-│   │   │   ├── OtpModal.tsx          # Mobile OTP verification modal
-│   │   │   ├── DisputeNoticeModal.tsx# Formal 42 CFR § 403.908 notice preview
+│   │   │   ├── CampaignConsole.tsx   # Campaign manager, live stats & HCP roster
+│   │   │   ├── DoctorTable.tsx       # HCP directory with NPPES badges & anomaly indicators
+│   │   │   ├── NpiSearchBar.tsx      # Real-time CMS NPPES NPI lookup
+│   │   │   ├── AuditCard.tsx         # Comprehensive Physician Audit dashboard component
+│   │   │   ├── DisputeNoticeModal.tsx# Formal 42 CFR § 403.908 federal notice modal
+│   │   │   ├── EnrollmentConfirmation.tsx # Concierge protection confirmation
+│   │   │   ├── SendAlertModal.tsx    # Outbound alert dispatch modal
 │   │   │   └── TigerDataBadge.tsx    # Live indicator of Timescale & pgvector queries
 │   │   └── lib/
 │   │       ├── api.ts            # Frontend API client
@@ -133,7 +134,7 @@ hcp-outbound/
 ### Backend (Python FastAPI)
 
 #### [NEW] `backend/requirements.txt`
-- `fastapi`, `uvicorn[standard]`, `asyncpg`, `sqlalchemy[asyncio]`, `pgvector`, `pydantic`, `pydantic-settings`, `httpx`, `twilio`, `python-dotenv`, `numpy`.
+- `fastapi`, `uvicorn[standard]`, `asyncpg`, `sqlalchemy[asyncio]`, `pgvector`, `pydantic`, `pydantic-settings`, `httpx`, `python-dotenv`, `numpy`.
 
 #### [NEW] `backend/app/services/nppes_service.py`
 - **Live NPPES Enrichment**:
@@ -170,34 +171,32 @@ hcp-outbound/
 #### [NEW] `backend/app/services/vector_service.py`
 - Queries pgvector using cosine distance `<=>` between doctor specialty embedding (derived from NPPES taxonomy) and payment product embedding. Flags mismatch scores > 0.70.
 
-#### [NEW] `backend/app/services/twilio_service.py`
-- Handles SMS dispatch and OTP generation/verification.
-- Dual-mode: if `TWILIO_ACCOUNT_SID` is set, dispatches real SMS to judge/presenter phone; also broadcasts events to local frontend emulator.
+#### [NEW] `backend/app/services/campaign_service.py`
+- Handles campaign tracking, secure audit token generation, and outbound dispatch simulation.
+- Generates secure signed links (`/audit/{token}`) for targeted physicians and tracks pipeline conversion states: Dispatched -> Opened -> Disputed -> Protected.
 
 ---
 
 ### Frontend (Next.js + Tailwind CSS)
 
 #### [NEW] `frontend/src/app/page.tsx`
-- Split-screen presentation view:
-  - **Left 60%**: Impiricus Outbound Campaign Command Center.
+- **Campaign Command Center & Interactive Audit Workspace**:
+  - **Campaign Management View**:
     - Live NPI Search Box: Type any 10-digit NPI to fetch live NPPES credentials in real time.
     - Live Tiger Data metrics badge (TimescaleDB hypertable query latency, pgvector cosine distance calculations).
     - HCP directory table with NPI, NPPES verified taxonomy, total reported $, meal count, and mismatch badge.
-    - Outbound trigger modal: Select doctor, enter mobile number, click "Launch Sunshine Alert SMS".
-    - Live pipeline funnel: Dispatched -> Opened -> Disputed -> Claimed.
-  - **Right 40%**: Realistic Mobile Phone Frame (iPhone view).
-    - Renders an interactive mobile screen.
-    - Incoming iOS lock-screen push notification / SMS bubble.
-    - Tapping SMS opens the zero-login **Audit Card** view with NPPES-verified credentials.
-    - Shows financial summary, meal count, top manufacturers, unreviewed status alert.
-    - "Dispute Unreviewed Items" CTA button.
-    - 4-digit OTP entry screen with instant validation.
-    - Reveals the **Formal 42 CFR § 403.908 Dispute Notice** addressed to the manufacturer compliance officer.
-    - Impiricus permanent alert system enrollment confirmation.
+    - Outbound alert dispatcher: Select doctor, preview notification summary, and trigger outbound alert link.
+    - Live pipeline funnel: Dispatched -> Opened -> Disputed -> Protected.
+    - Direct "Inspect Audit & Defense" action to immediately view the physician portal experience.
 
 #### [NEW] `frontend/src/app/audit/[token]/page.tsx`
-- Standalone mobile-optimized route so if the presenter or judges receive the SMS on their actual physical phone, tapping the link loads the exact same sleek audit card on their handheld device!
+- Dedicated **Physician Audit & Dispute Portal**:
+  - Clean, zero-friction web portal view displaying the doctor's verified NPPES credentials.
+  - Complete financial breakdown: Total reported dollars, meal count, top reporting manufacturers, and unreviewed status alert.
+  - Visual flags for TimescaleDB velocity spikes and pgvector specialty mismatches.
+  - "Dispute Unreviewed Items" direct 1-click action.
+  - Generates the **Formal 42 CFR § 403.908 Dispute Notice** addressed to the manufacturer compliance officer.
+  - Impiricus permanent alert system enrollment confirmation.
 
 ---
 
@@ -211,18 +210,15 @@ hcp-outbound/
 4. Execute backend tests for:
    - `GET /api/doctors` -> returns roster with pgvector anomaly flags and NPPES taxonomy.
    - `GET /api/doctors/{npi}/audit` -> returns audit metrics and TimescaleDB monthly velocity.
-   - `POST /api/campaign/send-sms` -> triggers Twilio or mock event with signed audit token.
-   - `POST /api/auth/verify-otp` -> validates 4-digit OTP.
+   - `POST /api/campaign/dispatch` -> dispatches outreach alert with signed audit token.
    - `POST /api/dispute/generate` -> generates 42 CFR § 403.908 notice.
 
-### Manual Split-Screen Verification
+### Manual Verification
 1. Launch backend (`uvicorn app.main:app`) and frontend (`npm run dev`).
 2. Open `http://localhost:3000` in a desktop browser.
 3. Test the NPI live lookup box: Enter an NPI and observe instant NPPES legal name, credential, and primary taxonomy resolution.
 4. Select an anomalous doctor (e.g., Dr. Jane Miller, Dermatologist with an Orthopedic Spine device charge).
-5. Click "Launch Sunshine Alert SMS".
-6. Observe the simulated SMS appear on the right-side phone emulator (and real phone if Twilio configured).
-7. Click the SMS link in the phone emulator -> verify Audit Card renders with total $, meals, and unreviewed warnings.
-8. Click "Dispute Unreviewed Items" -> verify OTP prompt appears -> enter 4-digit code.
-9. Verify success screen displays generated formal 42 CFR § 403.908 dispute notice and enrollment confirmation.
-10. Verify left-side Campaign Console pipeline counter updates in real time.
+5. Click "Dispatch Sunshine Alert" -> verify alert is dispatched and pipeline counter updates.
+6. Open the Physician Audit view (or navigate to `/audit/{token}`) -> verify Audit Card renders with total $, meals, velocity spikes, and specialty mismatch warnings.
+7. Click "Dispute Unreviewed Items" -> verify generated formal 42 CFR § 403.908 dispute notice displays with all statutory details.
+8. Confirm enrollment in Impiricus Concierge Shield and verify pipeline conversion reaches "Protected".
