@@ -1,0 +1,53 @@
+{
+  "source": {
+    "name": "NPPES NPI Registry",
+    "url": "https://npiregistry.cms.hhs.gov/api/",
+    "api_version": "2.1",
+    "retrieved_at": "2026-09-19T00:00:00+00:00"
+  },
+  "npi": "1972093250",
+  "entity_type": "NPI-1",
+  "status": "A",
+  "legal_name": {
+    "first_name": "WILLIAM",
+    "middle_name": "ARTHUR",
+    "last_name": "ZUKE",
+    "name_prefix": "Dr.",
+    "name_suffix": null,
+    "credential": "MD",
+    "organization_name": null
+  },
+  "enumeration_date": "2018-05-13",
+  "last_updated": "2026-02-17",
+  "primary_taxonomy": {
+    "code": "207XS0114X",
+    "description": "Orthopaedic Surgery, Adult Reconstructive Orthopaedic Surgery",
+    "license": "4301511411",
+    "license_state": "MI"
+  },
+  "practice_location": {
+    "address_1": "2490 S 11TH ST STE 201",
+    "address_2": null,
+    "city": "KALAMAZOO",
+    "state": "MI",
+    "postal_code": "490092175",
+    "country_code": "US",
+    "telephone_number": "269-343-1535"
+  },
+  "taxonomies": [
+    {
+      "code": "207X00000X",
+      "description": "Orthopaedic Surgery",
+      "primary": false,
+      "license": "4301511411",
+      "license_state": "MI"
+    },
+    {
+      "code": "207XS0114X",
+      "description": "Orthopaedic Surgery, Adult Reconstructive Orthopaedic Surgery",
+      "primary": true,
+      "license": "4301511411",
+      "license_state": "MI"
+    }
+  ]
+}

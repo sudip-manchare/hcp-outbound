@@ -1,7 +1,5 @@
-import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
 import Image from 'next/image';
-import { MOCK_PHYSICIANS, buildMockAuditCard } from '@/lib/mockData';
 import { AuditPageClient } from './AuditPageClient';
 
 interface AuditPageProps {
@@ -9,13 +7,9 @@ interface AuditPageProps {
 }
 
 export async function generateMetadata({ params }: AuditPageProps): Promise<Metadata> {
-  const { token } = await params;
-  const npi = token.replace('mock_token_', '');
-  const physician = MOCK_PHYSICIANS.find((p) => p.npi === npi);
+  await params;
   return {
-    title: physician
-      ? `Audit — ${physician.nppes.legal_name} | FalsePay`
-      : 'Secure Audit Portal | FalsePay',
+    title: 'Secure Audit Portal | FalsePay',
     description: 'Review your CMS Open Payments entries and dispute any unauthorized charges.',
     robots: 'noindex,nofollow',
   };
@@ -28,12 +22,6 @@ export async function generateMetadata({ params }: AuditPageProps): Promise<Meta
  */
 export default async function AuditPage({ params }: AuditPageProps) {
   const { token } = await params;
-  const npi = token.replace('mock_token_', '');
-  const physician = MOCK_PHYSICIANS.find((p) => p.npi === npi);
-
-  if (!physician) notFound();
-
-  const auditData = buildMockAuditCard(physician);
 
   return (
     <main
@@ -49,8 +37,7 @@ export default async function AuditPage({ params }: AuditPageProps) {
 
       {/* Interactive mobile audit & dispute flow */}
       <AuditPageClient
-        physician={physician}
-        auditToken={auditData.audit_token}
+        auditToken={token}
       />
 
       {/* Footer */}

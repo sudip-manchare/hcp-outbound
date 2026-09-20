@@ -99,7 +99,7 @@ hcp-outbound/
 │   │   └── main.py               # FastAPI application entrypoint
 │   ├── scripts/
 │   │   ├── init_tiger_db.py      # Extension activation, hypertable setup, tables
-│   │   └── seed_cms_data.py      # Seed real CMS doctors, payments & embeddings
+│   │   └── ingest_cms_open_payments.py # Official CMS Open Payments ingestion
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
@@ -156,15 +156,6 @@ hcp-outbound/
 - Converts `cms_payments` into a TimescaleDB hypertable partitioned on `payment_date`.
 - Creates pgvector ivfflat or HNSW index on `cms_payments.product_embedding`.
 
-#### [NEW] `backend/scripts/seed_cms_data.py`
-- Seeds 15+ realistic HCP profiles across Cardiology, Dermatology, Oncology, Orthopedics, and Neurology.
-- Enriches or validates NPIs against NPPES taxonomy schemas.
-- Seeds 100+ realistic CMS Open Payments transactions including:
-  - Legitimate meals & consulting fees.
-  - Unreviewed velocity dumps (TimescaleDB highlight: multiple payments in one week).
-  - Out-of-specialty mismatch entries (pgvector highlight: Orthopedic hip replacement logged for a Dermatologist).
-- Computes or embeds deterministic 384-dimensional vector embeddings so seed operates instantly without external API keys.
-
 #### [NEW] `backend/app/services/timescale_service.py`
 - Uses `time_bucket('1 month', payment_date)` to calculate payment frequency and detect sudden surges.
 
@@ -204,7 +195,7 @@ hcp-outbound/
 
 ### Automated Database & API Verification
 1. Run `python backend/scripts/init_tiger_db.py` to verify TimescaleDB and pgvector extensions initialize on Tiger Data.
-2. Run `python backend/scripts/seed_cms_data.py` to populate seed data and verify hypertables and vector indexes.
+2. Run `python backend/scripts/ingest_cms_open_payments.py --pages 1 --page-size 100` to ingest official CMS records and verify hypertables and vector indexes.
 3. Test Live NPPES Enrichment:
    - Run a test call to `GET /api/doctors/enrich/{npi}` with a real physician NPI (e.g. `1235149876`) to verify real-time response from `npiregistry.cms.hhs.gov`.
 4. Execute backend tests for:

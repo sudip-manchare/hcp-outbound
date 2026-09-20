@@ -40,9 +40,6 @@ export function SendAlertModal({ open, physician, onClose, onSent }: SendAlertMo
 
   if (!physician) return null;
 
-  const previewToken = `mock_token_${physician.npi}`;
-  const previewUrl = `/audit/${previewToken}`;
-
   return (
     <Modal open={open} onClose={onClose} title="Create secure review link" className="w-[500px]">
       <div className="space-y-4">
@@ -62,7 +59,6 @@ export function SendAlertModal({ open, physician, onClose, onSent }: SendAlertMo
           <div className="flex gap-4 pt-2 border-t border-[var(--c-border)] mt-2">
             <Stat label="Reported Total" value={`$${physician.total_amount.toLocaleString()}`} />
             <Stat label="Unreviewed" value={String(physician.unreviewed_count)} highlight={physician.unreviewed_count > 0} />
-            <Stat label="Mismatch Score" value={`${(physician.mismatch_score * 100).toFixed(0)}%`} highlight={physician.mismatch_score > 0.7} />
           </div>
         </div>
 
@@ -77,8 +73,8 @@ export function SendAlertModal({ open, physician, onClose, onSent }: SendAlertMo
               <CheckCircle2 size={11} /> 1-Click Zero-Login Token
             </span>
           </div>
-          <div className="w-full bg-[#f7fafb] border border-[var(--c-border)] rounded-lg px-3 py-2 text-xs font-mono text-[var(--c-text-secondary)] truncate">
-            {previewUrl}
+          <div className="w-full bg-[#f7fafb] border border-[var(--c-border)] rounded-lg px-3 py-2 text-xs text-[var(--c-text-secondary)]">
+            A secure API-generated link will appear after dispatch.
           </div>
         </div>
 
@@ -89,7 +85,7 @@ export function SendAlertModal({ open, physician, onClose, onSent }: SendAlertMo
             <p className="text-xs text-[#477481] font-semibold uppercase tracking-wider">Review message preview</p>
           </div>
           <p className="text-xs text-[var(--c-text-secondary)] leading-relaxed">
-            <strong>FalsePay secure review:</strong> Dr. {physician.nppes.last_name}, {physician.unreviewed_count} reported items totaling <strong>${physician.total_amount.toLocaleString()}</strong> are available for review under NPI {physician.npi}. Review before the applicable CMS window closes: <span className="text-[#08796f] underline">{previewUrl}</span>
+            <strong>FalsePay secure review:</strong> Dr. {physician.nppes.last_name}, {physician.unreviewed_count} reported items totaling <strong>${physician.total_amount.toLocaleString()}</strong> are available for review under NPI {physician.npi}. The API-generated secure link is included only after a successful dispatch.
           </p>
         </div>
 

@@ -1,4 +1,3 @@
-/// <reference types="@testing-library/jest-dom" />
 import '@testing-library/jest-dom';
 
 if (typeof window !== 'undefined') {
@@ -9,4 +8,3 @@ if (typeof window !== 'undefined') {
     this.open = false;
   };
 }
-

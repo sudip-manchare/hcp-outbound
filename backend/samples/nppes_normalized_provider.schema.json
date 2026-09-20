@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Normalized NPPES provider",
+  "description": "Final NPPES contract returned by GET /api/doctors/{npi}/enrich after a CMS payment record identifies a provider NPI.",
+  "type": "object",
+  "required": [
+    "source",
+    "npi",
+    "entity_type",
+    "status",
+    "legal_name",
+    "primary_taxonomy",
+    "practice_location",
+    "taxonomies"
+  ],
+  "properties": {
+    "source": {
+      "type": "object",
+      "required": ["name", "url", "api_version", "retrieved_at"],
+      "properties": {
+        "name": { "const": "NPPES NPI Registry" },
+        "url": { "type": "string", "format": "uri" },
+        "api_version": { "type": "string" },
+        "retrieved_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "npi": { "type": "string", "pattern": "^[0-9]{10}$" },
+    "entity_type": { "enum": ["NPI-1", "NPI-2"] },
+    "status": { "type": ["string", "null"] },
+    "legal_name": {
+      "type": "object",
+      "properties": {
+        "first_name": { "type": ["string", "null"] },
+        "middle_name": { "type": ["string", "null"] },
+        "last_name": { "type": ["string", "null"] },
+        "name_prefix": { "type": ["string", "null"] },
+        "name_suffix": { "type": ["string", "null"] },
+        "credential": { "type": ["string", "null"] },
+        "organization_name": { "type": ["string", "null"] }
+      }
+    },
+    "enumeration_date": { "type": ["string", "null"], "format": "date" },
+    "last_updated": { "type": ["string", "null"], "format": "date" },
+    "primary_taxonomy": { "$ref": "#/$defs/taxonomy" },
+    "practice_location": {
+      "type": "object",
+      "properties": {
+        "address_1": { "type": ["string", "null"] },
+        "address_2": { "type": ["string", "null"] },
+        "city": { "type": ["string", "null"] },
+        "state": { "type": ["string", "null"] },
+        "postal_code": { "type": ["string", "null"] },
+        "country_code": { "type": ["string", "null"] },
+        "telephone_number": { "type": ["string", "null"] }
+      }
+    },
+    "taxonomies": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/taxonomy" }
+    }
+  },
+  "$defs": {
+    "taxonomy": {
+      "type": "object",
+      "properties": {
+        "code": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"] },
+        "primary": { "type": "boolean" },
+        "license": { "type": ["string", "null"] },
+        "license_state": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
