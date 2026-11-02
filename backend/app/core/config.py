@@ -1,5 +1,10 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from __future__ import annotations
+
+import sys
 from functools import lru_cache
+
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -11,6 +16,12 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
     SECRET_KEY: str = "change-me-in-production"
+
+    # FIX: Added API_KEYS for admin route authentication. Set a comma-separated
+    # list of accepted keys via the API_KEYS environment variable in production.
+    # pydantic-settings automatically parses a JSON array from the env string.
+    API_KEYS: list[str] = []
+
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
     GEMINI_TIMEOUT_SECONDS: float = 30.0
@@ -28,6 +39,20 @@ class Settings(BaseSettings):
     CMS_OPEN_PAYMENTS_MAX_PAGE_SIZE: int = 100
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @model_validator(mode="after")
+    def _reject_insecure_production_defaults(self) -> "Settings":
+        # FIX: Prevent the server from starting in production with the placeholder
+        # SECRET_KEY. A default key makes HMAC-signed tokens trivially forgeable.
+        # Fail loudly at boot rather than silently at runtime.
+        if self.APP_ENV == "production" and self.SECRET_KEY == "change-me-in-production":
+            print(
+                "FATAL: SECRET_KEY must be set to a strong random value before "
+                "running in production. Set the SECRET_KEY environment variable.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return self
 
 
 @lru_cache()

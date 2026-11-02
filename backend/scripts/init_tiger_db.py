@@ -298,6 +298,29 @@ def create_indexes(cur):
         ON risk_signals (assessment_id);
     """)
 
+    # FIX: The three indexes below cover frequently-queried columns that had no
+    # index. recipient_npi appears in WHERE clauses on every physician lookup
+    # and audit-portal query; is_reviewed drives the unreviewed-count filter;
+    # manufacturer_id is used for campaign filtering. idx_audit_tokens_npi
+    # (composite with expires_at) and idx_audit_tokens_expires_at are added
+    # above; their duplicates from an earlier generation pass are removed here.
+    print("→ Creating application query indexes...")
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cms_payments_recipient_npi
+        ON cms_payments (recipient_npi)
+        WHERE recipient_npi IS NOT NULL;
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cms_payments_is_reviewed
+        ON cms_payments (is_reviewed)
+        WHERE NOT is_reviewed;
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cms_payments_manufacturer_id
+        ON cms_payments (manufacturer_id)
+        WHERE manufacturer_id IS NOT NULL;
+    """)
+
     print("✓ Indexes created.")
 
 

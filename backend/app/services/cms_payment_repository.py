@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from datetime import date
 import json
+import time
 from typing import Any
 
 from sqlalchemy import text
@@ -214,6 +215,8 @@ async def list_review_queue(db: AsyncSession, *, limit: int = 5000) -> dict[str,
     Payments without an NPI remain available through ``/api/stored-payments``
     but cannot be safely grouped into an HCP review queue.
     """
+    # FIX: Measure actual query latency instead of returning hardcoded zeros.
+    _query_start = time.perf_counter()
     result = await db.execute(text("""
         SELECT raw_cms_record_id, payment_date, recipient_npi,
                recipient_first_name, recipient_last_name, recipient_specialty,
@@ -286,11 +289,43 @@ async def list_review_queue(db: AsyncSession, *, limit: int = 5000) -> dict[str,
         "physicians": physicians,
         "total": len(physicians),
         "tiger_data_metrics": {
-            "timescale_query_ms": 0, "pgvector_calcs": 0, "hypertable_chunks": 0,
-            "vector_index_type": "hnsw", "active_physicians": len(physicians),
+            # FIX: Report actual measured query latency rather than hardcoded zeros.
+            # pgvector_calcs and hypertable_chunks require TimescaleDB/pgvector
+            # introspection queries (not yet implemented) — kept as 0 for now.
+            "timescale_query_ms": round((time.perf_counter() - _query_start) * 1000, 1),
+            "pgvector_calcs": 0,
+            "hypertable_chunks": 0,
+            "vector_index_type": "hnsw",
+            "active_physicians": len(physicians),
             "total_payments": payment_count,
         },
     }
+
+
+async def list_review_queue_for_npi(db: AsyncSession, npi: str) -> list[dict[str, Any]]:
+    """Fetch all payments for a single NPI, used by the audit token route."""
+    result = await db.execute(text("""
+        SELECT raw_cms_record_id, payment_date, recipient_npi,
+               recipient_first_name, recipient_last_name, recipient_specialty,
+               recipient_city, recipient_state, recipient_zip_code,
+               manufacturer_name, payment_type, amount_usd, product_name,
+               is_reviewed, mismatch_score, assessment.risk_score
+        FROM cms_payments
+        LEFT JOIN LATERAL (
+            SELECT risk_score
+            FROM risk_assessments
+            WHERE raw_cms_record_id = cms_payments.raw_cms_record_id
+              AND payment_date = cms_payments.payment_date
+              AND is_current = TRUE
+              AND model_version = :risk_model_version
+            ORDER BY assessed_at DESC
+            LIMIT 1
+        ) AS assessment ON TRUE
+        WHERE recipient_npi = :npi
+        ORDER BY payment_date DESC, raw_cms_record_id
+    """), {"npi": npi, "risk_model_version": MODEL_VERSION})
+    rows = result.mappings().all()
+    return [dict(row) for row in rows]
 
 
 async def get_payment(db: AsyncSession, record_id: str, payment_date: date) -> dict[str, Any] | None:

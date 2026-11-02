@@ -2,39 +2,122 @@
 
 from __future__ import annotations
 
-from datetime import date
+import hashlib
+import uuid
+from datetime import date, datetime, timezone
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.database import get_db
-from app.models.schema import CMSIngestionRequest, LocalPaymentReviewUpdate
+from app.models.schema import (
+    CMSIngestionRequest,
+    CampaignDispatchRequest,
+    DisputeGenerateRequest,
+    LocalPaymentReviewUpdate,
+)
+from app.services.campaign_service import (
+    build_audit_url,
+    build_dispatch_preview,
+    generate_audit_token,
+    token_expiry,
+)
 from app.services.cms_open_payments_service import CMSOpenPaymentsServiceError, fetch_payments_page
 from app.services.cms_payment_repository import (
     UNSET,
     delete_payment,
     get_payment,
     ingest_cms_page,
-    list_review_queue,
     list_payments,
+    list_review_queue,
     update_local_review,
 )
-from app.services.nppes_service import NPPESProviderNotFoundError, NPPESServiceError, fetch_provider, validate_npi
-from app.services.risk_triage_service import assess_payment, get_current_assessment
 from app.services.gemini_explanation_service import explain_assessment
+from app.services.nppes_service import (
+    NPPESProviderNotFoundError,
+    NPPESServiceError,
+    fetch_provider,
+    validate_npi,
+)
+from app.services.risk_triage_service import assess_payment, get_current_assessment
 
 settings = get_settings()
 app = FastAPI(title="HCP Outbound API", version="0.1.0")
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# FIX: Add HTTP security response headers to every reply. These prevent
+# clickjacking (X-Frame-Options), MIME-type sniffing (X-Content-Type-Options),
+# and limit resource loading (CSP). Applied at middleware level so all routes
+# benefit without per-handler boilerplate.
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    # Adjust CSP directives when a CDN or external font provider is added.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:;"
+    )
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["*"],
+    # FIX: Restrict allowed headers instead of the previous allow_headers=["*"].
+    # Allowing every header widens the cross-origin attack surface unnecessarily.
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "Accept"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Admin authentication dependency
+# FIX: All state-mutating and data-reading admin routes previously had no
+# authentication, letting anyone call ingestion, deletion, or triage endpoints.
+# This dependency checks the X-API-Key header against configured API_KEYS.
+# Physician-portal routes (/api/audit/*, /api/dispute/*) use token auth instead.
+# ---------------------------------------------------------------------------
+
+def _require_admin(x_api_key: Annotated[str | None, Header()] = None) -> None:
+    """Reject requests that lack a valid admin API key."""
+    if not settings.API_KEYS:
+        # No keys configured: allow in development, block in production.
+        # The config validator already ensures SECRET_KEY is set in production;
+        # add a similar env-level guard for API_KEYS when ready to enforce it.
+        if settings.APP_ENV == "production":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Admin authentication is not configured on this server.",
+            )
+        return  # development: open for local iteration
+    if not x_api_key or x_api_key not in settings.API_KEYS:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A valid X-API-Key header is required.",
+        )
+
+
+# Convenience type alias used as a parameter annotation on admin routes.
+AdminAuth = Annotated[None, Depends(_require_admin)]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _bad_npi(npi: str) -> None:
     try:
@@ -42,6 +125,37 @@ def _bad_npi(npi: str) -> None:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+
+def _resolve_token_hash(token: str) -> str:
+    """Return the SHA-256 hex digest used as the DB lookup key for a token.
+
+    FIX: Tokens are stored as their SHA-256 hash, not as plaintext. This
+    means a database breach cannot be used to forge audit links.
+    """
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def _load_token_record(db: AsyncSession, token: str) -> dict:
+    """Look up a token record and enforce expiry, raising HTTP exceptions on failure."""
+    token_hash = _resolve_token_hash(token)
+    row = await db.execute(
+        text("SELECT npi, expires_at, accessed, pipeline_state FROM audit_tokens WHERE token = :h"),
+        {"h": token_hash},
+    )
+    record = row.mappings().one_or_none()
+    if record is None:
+        raise HTTPException(status_code=404, detail="This audit link is invalid or has not been issued.")
+    expires_at = record["expires_at"]
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > expires_at:
+        raise HTTPException(status_code=410, detail="This audit link has expired.")
+    return dict(record) | {"token_hash": token_hash}
+
+
+# ---------------------------------------------------------------------------
+# Public routes (no auth)
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health() -> dict[str, object]:
@@ -57,7 +171,7 @@ async def health() -> dict[str, object]:
 
 @app.get("/api/doctors/enrich/{npi}")
 async def enrich_doctor(npi: str) -> dict:
-    """Retrieve a provider live from the official NPPES Registry."""
+    """Retrieve a provider live from the official NPPES Registry (public data)."""
     _bad_npi(npi)
     try:
         return await fetch_provider(npi)
@@ -76,11 +190,7 @@ async def cms_payments(
     payment_nature: str | None = Query(default=None),
     recipient_type: str | None = Query(default=None),
 ) -> dict:
-    """Retrieve a generic, paginated CMS General Payment feed.
-
-    Each payment includes a recipient NPI when available. Call the NPPES route
-    after selecting the provider you want to inspect.
-    """
+    """Retrieve a generic, paginated CMS General Payment feed (public data)."""
     try:
         return await fetch_payments_page(
             limit=limit,
@@ -94,12 +204,17 @@ async def cms_payments(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+# ---------------------------------------------------------------------------
+# Admin routes (X-API-Key required)
+# ---------------------------------------------------------------------------
+
 @app.post("/api/ingestions/cms", status_code=status.HTTP_201_CREATED)
 async def pull_and_ingest_cms_payments(
     request: CMSIngestionRequest,
     db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
 ) -> dict:
-    """The frontend's one-call action: pull CMS, then persist only new rows."""
+    """Pull one CMS page and persist only new rows. Requires admin auth."""
     try:
         return await ingest_cms_page(
             db,
@@ -120,14 +235,18 @@ async def stored_payments(
     offset: int = Query(default=0, ge=0),
     recipient_state: str | None = Query(default=None, min_length=2, max_length=2),
     db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
 ) -> dict:
-    """Read a page of local, previously ingested CMS records."""
+    """Read a page of locally ingested CMS records. Requires admin auth."""
     return await list_payments(db, limit=limit, offset=offset, recipient_state=recipient_state)
 
 
 @app.get("/api/doctors")
-async def review_queue(db: AsyncSession = Depends(get_db)) -> dict:
-    """Return the UI review queue derived from locally ingested CMS records."""
+async def review_queue(
+    db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
+) -> dict:
+    """Return the UI review queue from locally ingested CMS records. Requires admin auth."""
     return await list_review_queue(db)
 
 
@@ -136,6 +255,7 @@ async def stored_payment(
     record_id: str,
     payment_date: date,
     db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
 ) -> dict:
     record = await get_payment(db, record_id, payment_date)
     if not record:
@@ -148,8 +268,9 @@ async def triage_stored_payment(
     record_id: str,
     payment_date: date,
     db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
 ) -> dict:
-    """Return the stored model result plus on-demand Gemini interpretation."""
+    """Return stored model result plus on-demand Gemini interpretation. Requires admin auth."""
     assessment = await assess_payment(db, record_id, payment_date)
     if not assessment:
         raise HTTPException(status_code=404, detail="Stored CMS payment not found.")
@@ -161,8 +282,9 @@ async def current_stored_payment_triage(
     record_id: str,
     payment_date: date,
     db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
 ) -> dict:
-    """Read the current assessment for this ingestion cycle, if it exists."""
+    """Read the current assessment for this ingestion cycle. Requires admin auth."""
     assessment = await get_current_assessment(db, record_id, payment_date)
     if not assessment:
         raise HTTPException(status_code=404, detail="No current risk assessment for this payment.")
@@ -175,8 +297,9 @@ async def update_stored_payment(
     payment_date: date,
     update: LocalPaymentReviewUpdate,
     db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
 ) -> dict:
-    """Update local review annotations without changing CMS source fields."""
+    """Update local review annotations without changing CMS source fields. Requires admin auth."""
     try:
         record = await update_local_review(
             db,
@@ -197,8 +320,294 @@ async def delete_stored_payment(
     record_id: str,
     payment_date: date,
     db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
 ) -> Response:
-    """Delete only the local copy; the immutable CMS source can be re-ingested later."""
+    """Delete only the local copy; CMS source can be re-ingested later. Requires admin auth."""
     if not await delete_payment(db, record_id, payment_date):
         raise HTTPException(status_code=404, detail="Stored CMS payment not found.")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Campaign routes (admin auth)
+# FIX: These routes were previously missing entirely or were orphaned stubs.
+# campaign_service.py had SQL using asyncpg $1 placeholders which are
+# incompatible with SQLAlchemy's :named param style. All DB operations are
+# now here using text() with :named params, consistent with the rest of the app.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/campaign/dispatch", status_code=status.HTTP_201_CREATED)
+async def campaign_dispatch(
+    request: CampaignDispatchRequest,
+    db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
+) -> dict:
+    """Generate a signed audit token and return the outbound alert preview.
+
+    In production, pass the preview body to an SMS/email provider.
+    Requires admin auth.
+    """
+    _bad_npi(request.npi)
+
+    # Fetch a display name from retained CMS data for the preview message.
+    name_row = await db.scalar(text("""
+        SELECT recipient_first_name || ' ' || recipient_last_name
+        FROM cms_payments
+        WHERE recipient_npi = :npi AND recipient_last_name IS NOT NULL
+        LIMIT 1
+    """), {"npi": request.npi})
+    name_parts = (name_row or "Unknown Recipient").split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+    # Aggregate payment summary for the preview body.
+    agg_result = await db.execute(text("""
+        SELECT
+            COALESCE(SUM(amount_usd), 0)                         AS total_usd,
+            COUNT(DISTINCT manufacturer_id)                       AS manufacturer_count,
+            COUNT(*) FILTER (WHERE NOT is_reviewed)              AS unreviewed_count
+        FROM cms_payments
+        WHERE recipient_npi = :npi
+    """), {"npi": request.npi})
+    agg = agg_result.mappings().one_or_none() or {}
+    total_usd = float(agg.get("total_usd") or 0)
+    manufacturer_count = int(agg.get("manufacturer_count") or 0)
+    unreviewed_count = int(agg.get("unreviewed_count") or 0)
+
+    token = generate_audit_token(request.npi)
+    expires_at = token_expiry()
+    audit_url = build_audit_url(token)
+
+    # FIX: Store the SHA-256 hash of the token, not the plaintext value.
+    # A DB breach cannot reconstruct the plaintext token from its hash, so
+    # stolen hashes cannot be used to forge audit portal links.
+    token_hash = _resolve_token_hash(token)
+    await db.execute(text("""
+        INSERT INTO audit_tokens (token, npi, expires_at, accessed, pipeline_state)
+        VALUES (:token_hash, :npi, :expires_at, FALSE, 'dispatched')
+        ON CONFLICT (token) DO NOTHING
+    """), {"token_hash": token_hash, "npi": request.npi, "expires_at": expires_at})
+
+    preview = build_dispatch_preview(
+        npi=request.npi,
+        first_name=first_name,
+        last_name=last_name,
+        total_usd=total_usd,
+        unreviewed_count=unreviewed_count,
+        manufacturer_count=manufacturer_count,
+        audit_url=audit_url,
+    )
+    return {**preview, "audit_token": token, "simulated": True}
+
+
+@app.get("/api/campaign/stats")
+async def campaign_stats(
+    db: AsyncSession = Depends(get_db),
+    _auth: AdminAuth = None,
+) -> dict:
+    """Return live pipeline funnel counts from non-expired audit tokens. Requires admin auth."""
+    result = await db.execute(text("""
+        SELECT
+            COUNT(*) FILTER (WHERE pipeline_state = 'dispatched') AS dispatched,
+            COUNT(*) FILTER (WHERE pipeline_state = 'opened')     AS opened,
+            COUNT(*) FILTER (WHERE pipeline_state = 'disputed')   AS disputed,
+            COUNT(*) FILTER (WHERE pipeline_state = 'protected')  AS protected
+        FROM audit_tokens
+        WHERE expires_at > NOW()
+    """))
+    return dict(result.mappings().one())
+
+
+# ---------------------------------------------------------------------------
+# Physician audit portal route (token-based auth, no admin key)
+# FIX: This route was entirely missing. AuditPageClient.tsx called
+# GET /api/audit/{token} which returned a network error because the route
+# did not exist, making the entire physician-facing portal non-functional.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/audit/{token}")
+async def get_audit_card(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Resolve a physician audit portal token and return their payment summary.
+
+    Called by the zero-login physician portal page. No admin key required;
+    the signed token is the physician's credential.
+    """
+    token_record = await _load_token_record(db, token)
+    npi = token_record["npi"]
+    token_hash = token_record["token_hash"]
+
+    # Record 'opened' pipeline state transition on first access.
+    if token_record["pipeline_state"] == "dispatched":
+        await db.execute(text("""
+            UPDATE audit_tokens
+            SET pipeline_state = 'opened', accessed = TRUE
+            WHERE token = :h
+        """), {"h": token_hash})
+
+    # Build physician payment summary from retained CMS records.
+    payments_result = await db.execute(text("""
+        SELECT raw_cms_record_id, payment_date, manufacturer_name, payment_type,
+               amount_usd, product_name, is_reviewed, mismatch_score,
+               recipient_first_name, recipient_last_name, recipient_specialty,
+               recipient_city, recipient_state, recipient_zip_code
+        FROM cms_payments
+        WHERE recipient_npi = :npi
+        ORDER BY payment_date DESC
+        LIMIT 200
+    """), {"npi": npi})
+    rows = [dict(r) for r in payments_result.mappings()]
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No payment records found for this audit link.")
+
+    first = rows[0]
+    payments = [
+        {
+            "id": r["raw_cms_record_id"],
+            "payment_date": r["payment_date"].date().isoformat(),
+            "manufacturer": r["manufacturer_name"],
+            "nature_of_payment": r["payment_type"] or "Not reported",
+            "amount": float(r["amount_usd"]),
+            "product_name": r["product_name"] or "Not reported",
+            "product_category": "",
+            "reviewed": bool(r["is_reviewed"]),
+            "mismatch_score": float(r["mismatch_score"] or 0),
+            "risk_score": 0,
+            "velocity_flag": False,
+        }
+        for r in rows
+    ]
+    physician = {
+        "npi": npi,
+        "nppes": {
+            "npi": npi,
+            "legal_name": f"{first.get('recipient_first_name', '')} {first.get('recipient_last_name', '')}".strip(),
+            "first_name": first.get("recipient_first_name") or "",
+            "last_name": first.get("recipient_last_name") or "",
+            "credential": "", "taxonomy_code": "", "taxonomy_desc": "",
+            "primary_specialty": first.get("recipient_specialty") or "Not reported",
+            "address": {
+                "address_1": "",
+                "city": first.get("recipient_city") or "",
+                "state": first.get("recipient_state") or "",
+                "postal_code": first.get("recipient_zip_code") or "",
+            },
+            "verified": False, "enriched_at": "",
+        },
+        "payments": payments,
+        "total_amount": sum(float(r["amount_usd"]) for r in rows),
+        "meal_count": sum(
+            1 for r in rows
+            if "food" in (r.get("payment_type") or "").lower()
+            or "meal" in (r.get("payment_type") or "").lower()
+        ),
+        "unreviewed_count": sum(1 for r in rows if not r["is_reviewed"]),
+        "mismatch_score": max((float(r.get("mismatch_score") or 0) for r in rows), default=0.0),
+        "risk_score": 0, "risk_level": "low", "outlier_count": 0,
+    }
+    return {
+        "physician": physician,
+        "audit_token": token,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "velocity_summary": [],
+        "top_manufacturers": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dispute generation route (token-based auth, no admin key)
+# FIX: This route was entirely missing. The frontend called POST /api/dispute/generate
+# which resulted in a network error. Now it validates the audit token, verifies
+# the NPI binding, selects unreviewed payments, and returns a DisputeNotice.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/dispute/generate", status_code=status.HTTP_201_CREATED)
+async def generate_dispute(
+    request: DisputeGenerateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Generate a 42 CFR § 403.908 dispute notice draft for unreviewed payments.
+
+    The audit token verifies the physician's identity — this prevents an
+    unauthenticated caller from generating dispute notices for arbitrary NPIs.
+    """
+    token_record = await _load_token_record(db, request.audit_token)
+    token_hash = token_record["token_hash"]
+
+    # FIX: Validate that the token is bound to the requested NPI.
+    # Without this check, any valid token could generate a notice for any NPI.
+    if token_record["npi"] != request.npi:
+        raise HTTPException(
+            status_code=403,
+            detail="The audit token is not issued for the requested NPI.",
+        )
+
+    # Fetch unreviewed payments eligible for dispute.
+    payments_result = await db.execute(text("""
+        SELECT raw_cms_record_id, payment_date, manufacturer_name, manufacturer_id,
+               payment_type, amount_usd, product_name,
+               recipient_first_name, recipient_last_name, recipient_specialty,
+               recipient_city, recipient_state
+        FROM cms_payments
+        WHERE recipient_npi = :npi AND NOT is_reviewed
+        ORDER BY payment_date DESC
+        LIMIT 50
+    """), {"npi": request.npi})
+    payments = [dict(r) for r in payments_result.mappings()]
+
+    if not payments:
+        raise HTTPException(
+            status_code=422,
+            detail="No unreviewed payments found. All entries have already been reviewed.",
+        )
+
+    first = payments[0]
+    physician_name = (
+        f"{first.get('recipient_first_name', '')} {first.get('recipient_last_name', '')}".strip()
+        or "Unknown Physician"
+    )
+    physician_address = ", ".join(
+        p for p in [first.get("recipient_city") or "", first.get("recipient_state") or ""] if p
+    )
+
+    disputed_payments = [
+        {
+            "id": p["raw_cms_record_id"],
+            "payment_date": p["payment_date"].date().isoformat(),
+            "manufacturer": p["manufacturer_name"],
+            "nature_of_payment": p["payment_type"] or "Not reported",
+            "amount": float(p["amount_usd"]),
+            "product_name": p["product_name"] or "Not reported",
+            "product_category": "", "reviewed": False,
+            "mismatch_score": 0.0, "risk_score": 0, "velocity_flag": False,
+        }
+        for p in payments
+    ]
+
+    # Advance pipeline state to 'disputed'.
+    await db.execute(text("""
+        UPDATE audit_tokens
+        SET pipeline_state = 'disputed'
+        WHERE token = :h AND pipeline_state IN ('dispatched', 'opened')
+    """), {"h": token_hash})
+
+    return {
+        "physician_name": physician_name,
+        "physician_npi": request.npi,
+        "physician_credential": "",
+        "physician_specialty": first.get("recipient_specialty") or "Not reported",
+        "physician_address": physician_address,
+        "manufacturer_name": payments[0]["manufacturer_name"] or "Unknown Reporting Entity",
+        "manufacturer_contact": "Compliance Officer",
+        "disputed_payments": disputed_payments,
+        "total_disputed_amount": sum(float(p["amount_usd"]) for p in payments),
+        # FIX: Label clearly as a DRAFT template. The notice is not formally
+        # submitted by this API call; the physician must review and submit it.
+        # Presenting it as a "formal" notice without that caveat is a regulatory risk.
+        "legal_citation": "42 CFR \u00a7 403.908 \u2014 DRAFT template, review before submission",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "notice_id": str(uuid.uuid4()),
+    }

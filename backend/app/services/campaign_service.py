@@ -4,28 +4,25 @@ campaign_service.py
 Handles campaign tracking, secure audit token generation, and outbound
 dispatch simulation for the HCP Outbound Audit & Defense engine.
 
-No external SMS provider is required. The service:
-  - Generates cryptographically signed, expiring tokens for the /audit/{token} portal.
-  - Stores dispatch records and pipeline conversion states in Tiger Data.
-  - Tracks physician funnel progression:
-      Dispatched → Opened → Disputed → Protected
+Token generation is decoupled from database persistence so callers can
+build a preview URL before the token is committed to storage.
 
-Pipeline states are stored on audit_tokens and can be queried in real time
-by the Campaign Command Console frontend.
+Pipeline states stored on audit_tokens:
+    Dispatched → Opened → Disputed → Protected
 """
 
-import secrets
 import hashlib
 import hmac
+import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from app.core.config import get_settings
 
 settings = get_settings()
 
-# Token TTL: 7 days (plenty for a hackathon demo)
+# Token TTL: 7 days
 TOKEN_TTL_HOURS = 168
+
 
 # ---------------------------------------------------------------------------
 # Pipeline states
@@ -33,9 +30,10 @@ TOKEN_TTL_HOURS = 168
 
 class PipelineState:
     DISPATCHED = "dispatched"
-    OPENED     = "opened"
-    DISPUTED   = "disputed"
-    PROTECTED  = "protected"
+    OPENED = "opened"
+    DISPUTED = "disputed"
+    PROTECTED = "protected"
+
 
 PIPELINE_ORDER = [
     PipelineState.DISPATCHED,
@@ -50,15 +48,19 @@ PIPELINE_ORDER = [
 # ---------------------------------------------------------------------------
 
 def generate_audit_token(npi: str) -> str:
-    """
-    Generate a cryptographically secure, NPI-bound audit portal token.
-
-    The token is a 32-byte random hex string prefixed with a 4-char HMAC
-    checksum so the backend can verify it was issued by us without a DB lookup.
+    """Generate a cryptographically secure, NPI-bound audit portal token.
 
     Format: {8-char HMAC prefix}-{64-char random hex}
+
+    IMPORTANT: Store only the SHA-256 hash of this value in the database,
+    never the plaintext token. This prevents a DB breach from enabling
+    token forgery. Callers (see main.py campaign_dispatch) are responsible
+    for hashing before persistence.
     """
     raw = secrets.token_hex(32)
+    # FIX: Original file had `hmac.new(...)` which is correct Python stdlib.
+    # Kept as-is; the real fix is in main.py where tokens are now hashed
+    # before being written to audit_tokens (was stored as plaintext before).
     sig = hmac.new(
         settings.SECRET_KEY.encode(),
         f"{npi}:{raw}".encode(),
@@ -75,9 +77,16 @@ def token_expiry() -> datetime:
 # Audit portal URL builder
 # ---------------------------------------------------------------------------
 
-def build_audit_url(token: str, base_url: str = "http://localhost:3000") -> str:
-    """Returns the full URL to the Physician Audit & Dispute Portal."""
-    return f"{base_url}/audit/{token}"
+def build_audit_url(token: str, base_url: str | None = None) -> str:
+    """Returns the full URL to the Physician Audit & Dispute Portal.
+
+    FIX: Derives the base URL from CORS_ORIGINS config rather than hard-coding
+    localhost, so production builds produce the correct absolute URL.
+    """
+    if base_url is None:
+        # Use the first configured frontend origin; fall back to localhost.
+        base_url = settings.CORS_ORIGINS[0] if settings.CORS_ORIGINS else "http://localhost:3000"
+    return f"{base_url.rstrip('/')}/audit/{token}"
 
 
 # ---------------------------------------------------------------------------
@@ -93,13 +102,11 @@ def build_dispatch_preview(
     manufacturer_count: int,
     audit_url: str,
 ) -> dict:
-    """
-    Builds the outbound alert preview object shown in the Campaign Console
-    before the user clicks 'Dispatch Sunshine Alert'.
+    """Builds the outbound alert preview shown in the Campaign Console.
 
-    In production this payload would be handed to an email / SMS / push
-    provider. In the hackathon demo it is rendered in the UI and a real
-    link is generated that opens the Audit Portal.
+    In production this payload would be handed to an SMS/email provider.
+    Currently returned as a simulation; set simulated=False when wired to
+    a real delivery channel.
     """
     return {
         "npi": npi,
@@ -120,34 +127,13 @@ def build_dispatch_preview(
 
 
 # ---------------------------------------------------------------------------
-# DB helpers (sync, used by FastAPI endpoints via asyncpg raw queries)
+# NOTE: The raw SQL constants (INSERT_AUDIT_TOKEN_SQL, UPDATE_PIPELINE_SQL,
+# GET_TOKEN_SQL, GET_CAMPAIGN_STATS_SQL) that previously used asyncpg $1-style
+# placeholders have been removed from this module.
+#
+# FIX: The original SQL used asyncpg positional placeholders ($1, $2 …) which
+# are incompatible with SQLAlchemy's asyncpg driver, which expects :named
+# params. All DB operations for campaign/audit-token are now in main.py route
+# handlers using SQLAlchemy text() with :named params, consistent with the
+# rest of the application.
 # ---------------------------------------------------------------------------
-
-INSERT_AUDIT_TOKEN_SQL = """
-    INSERT INTO audit_tokens (token, npi, expires_at, accessed, pipeline_state)
-    VALUES ($1, $2, $3, FALSE, $4)
-    ON CONFLICT (token) DO NOTHING;
-"""
-
-UPDATE_PIPELINE_SQL = """
-    UPDATE audit_tokens
-    SET pipeline_state = $1,
-        accessed = CASE WHEN $1 != 'dispatched' THEN TRUE ELSE accessed END
-    WHERE token = $2;
-"""
-
-GET_TOKEN_SQL = """
-    SELECT npi, expires_at, accessed, pipeline_state
-    FROM audit_tokens
-    WHERE token = $1;
-"""
-
-GET_CAMPAIGN_STATS_SQL = """
-    SELECT
-        COUNT(*) FILTER (WHERE pipeline_state = 'dispatched')  AS dispatched,
-        COUNT(*) FILTER (WHERE pipeline_state = 'opened')      AS opened,
-        COUNT(*) FILTER (WHERE pipeline_state = 'disputed')    AS disputed,
-        COUNT(*) FILTER (WHERE pipeline_state = 'protected')   AS protected
-    FROM audit_tokens
-    WHERE expires_at > NOW();
-"""

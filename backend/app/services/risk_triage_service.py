@@ -222,8 +222,14 @@ async def _store_assessment(db: AsyncSession, payment: dict[str, Any], assessmen
 
 async def run_isolation_forest_triage(db: AsyncSession) -> dict[str, int | str]:
     """Fit the model to the current dataset and persist its complete batch output."""
+    import asyncio
     payments = await _load_all_payments(db)
-    assessments = score_payments(payments)
+    # FIX: score_payments trains a scikit-learn IsolationForest — pure CPU work.
+    # Running it directly blocks the async event loop for the full training
+    # duration (proportional to dataset size). Offload to a thread pool so
+    # other API requests can proceed while the model trains.
+    loop = asyncio.get_running_loop()
+    assessments = await loop.run_in_executor(None, score_payments, payments)
     # Support an explicit re-run after a model-version change as well as the
     # normal ingestion lifecycle, which performs this invalidation first.
     await db.execute(text("""
