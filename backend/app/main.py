@@ -1,19 +1,21 @@
-"""FastAPI entry point for live NPPES and CMS Open Payments enrichment."""
+"""FastAPI entry point: CMS Open Payments served from MongoDB, NPPES enrichment live."""
 
 from __future__ import annotations
 
 import hashlib
 import uuid
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
-from app.core.database import get_db
+from app.core.database import close_db, from_bson, get_db
+from app.models.documents import AuditToken, CmsPayment
 from app.models.schema import (
     CMSIngestionRequest,
     CampaignDispatchRequest,
@@ -26,7 +28,7 @@ from app.services.campaign_service import (
     generate_audit_token,
     token_expiry,
 )
-from app.services.cms_open_payments_service import CMSOpenPaymentsServiceError, fetch_payments_page
+from app.services.cms_open_payments_service import CMSOpenPaymentsServiceError
 from app.services.cms_payment_repository import (
     UNSET,
     delete_payment,
@@ -34,6 +36,7 @@ from app.services.cms_payment_repository import (
     ingest_cms_page,
     list_payments,
     list_review_queue,
+    query_cms_payments_page,
     update_local_review,
 )
 from app.services.gemini_explanation_service import explain_assessment
@@ -46,7 +49,15 @@ from app.services.nppes_service import (
 from app.services.risk_triage_service import assess_payment, get_current_assessment
 
 settings = get_settings()
-app = FastAPI(title="HCP Outbound API", version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await close_db()
+
+
+app = FastAPI(title="HCP Outbound API", version="0.1.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -135,14 +146,13 @@ def _resolve_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-async def _load_token_record(db: AsyncSession, token: str) -> dict:
+async def _load_token_record(db: AsyncIOMotorDatabase, token: str) -> dict:
     """Look up a token record and enforce expiry, raising HTTP exceptions on failure."""
     token_hash = _resolve_token_hash(token)
-    row = await db.execute(
-        text("SELECT npi, expires_at, accessed, pipeline_state FROM audit_tokens WHERE token = :h"),
-        {"h": token_hash},
+    record = await db[AuditToken.Settings.name].find_one(
+        {"token": token_hash},
+        {"_id": 0, "npi": 1, "expires_at": 1, "accessed": 1, "pipeline_state": 1},
     )
-    record = row.mappings().one_or_none()
     if record is None:
         raise HTTPException(status_code=404, detail="This audit link is invalid or has not been issued.")
     expires_at = record["expires_at"]
@@ -162,8 +172,13 @@ async def health() -> dict[str, object]:
     return {
         "status": "ok",
         "sources": {
-            "nppes": settings.NPPES_API_BASE_URL,
-            "cms_open_payments": settings.CMS_OPEN_PAYMENTS_API_BASE_URL,
+            "nppes": {"mode": "live_api", "url": settings.NPPES_API_BASE_URL},
+            "cms_open_payments": {
+                "mode": "mongodb",
+                "database": settings.MONGODB_DB_NAME,
+                "collection": CmsPayment.Settings.name,
+                "ingested_from": settings.CMS_OPEN_PAYMENTS_API_BASE_URL,
+            },
             "cms_dataset_id": settings.CMS_OPEN_PAYMENTS_GENERAL_DATASET_ID,
         },
     }
@@ -189,19 +204,18 @@ async def cms_payments(
     manufacturer_id: str | None = Query(default=None),
     payment_nature: str | None = Query(default=None),
     recipient_type: str | None = Query(default=None),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
-    """Retrieve a generic, paginated CMS General Payment feed (public data)."""
-    try:
-        return await fetch_payments_page(
-            limit=limit,
-            offset=offset,
-            recipient_state=recipient_state,
-            manufacturer_id=manufacturer_id,
-            payment_nature=payment_nature,
-            recipient_type=recipient_type,
-        )
-    except CMSOpenPaymentsServiceError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    """Paginated CMS General Payment feed served from MongoDB (no live CMS call)."""
+    return await query_cms_payments_page(
+        db,
+        limit=limit,
+        offset=offset,
+        recipient_state=recipient_state,
+        manufacturer_id=manufacturer_id,
+        payment_nature=payment_nature,
+        recipient_type=recipient_type,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +225,7 @@ async def cms_payments(
 @app.post("/api/ingestions/cms", status_code=status.HTTP_201_CREATED)
 async def pull_and_ingest_cms_payments(
     request: CMSIngestionRequest,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Pull one CMS page and persist only new rows. Requires admin auth."""
@@ -234,7 +248,7 @@ async def stored_payments(
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     recipient_state: str | None = Query(default=None, min_length=2, max_length=2),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Read a page of locally ingested CMS records. Requires admin auth."""
@@ -243,7 +257,7 @@ async def stored_payments(
 
 @app.get("/api/doctors")
 async def review_queue(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Return the UI review queue from locally ingested CMS records. Requires admin auth."""
@@ -254,7 +268,7 @@ async def review_queue(
 async def stored_payment(
     record_id: str,
     payment_date: date,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     record = await get_payment(db, record_id, payment_date)
@@ -267,7 +281,7 @@ async def stored_payment(
 async def triage_stored_payment(
     record_id: str,
     payment_date: date,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Return stored model result plus on-demand Gemini interpretation. Requires admin auth."""
@@ -281,7 +295,7 @@ async def triage_stored_payment(
 async def current_stored_payment_triage(
     record_id: str,
     payment_date: date,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Read the current assessment for this ingestion cycle. Requires admin auth."""
@@ -296,7 +310,7 @@ async def update_stored_payment(
     record_id: str,
     payment_date: date,
     update: LocalPaymentReviewUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Update local review annotations without changing CMS source fields. Requires admin auth."""
@@ -319,7 +333,7 @@ async def update_stored_payment(
 async def delete_stored_payment(
     record_id: str,
     payment_date: date,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> Response:
     """Delete only the local copy; CMS source can be re-ingested later. Requires admin auth."""
@@ -330,16 +344,14 @@ async def delete_stored_payment(
 
 # ---------------------------------------------------------------------------
 # Campaign routes (admin auth)
-# FIX: These routes were previously missing entirely or were orphaned stubs.
-# campaign_service.py had SQL using asyncpg $1 placeholders which are
-# incompatible with SQLAlchemy's :named param style. All DB operations are
-# now here using text() with :named params, consistent with the rest of the app.
+# All MongoDB operations for campaigns live here; campaign_service.py stays
+# free of database access.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/campaign/dispatch", status_code=status.HTTP_201_CREATED)
 async def campaign_dispatch(
     request: CampaignDispatchRequest,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Generate a signed audit token and return the outbound alert preview.
@@ -350,26 +362,34 @@ async def campaign_dispatch(
     _bad_npi(request.npi)
 
     # Fetch a display name from retained CMS data for the preview message.
-    name_row = await db.scalar(text("""
-        SELECT recipient_first_name || ' ' || recipient_last_name
-        FROM cms_payments
-        WHERE recipient_npi = :npi AND recipient_last_name IS NOT NULL
-        LIMIT 1
-    """), {"npi": request.npi})
+    payments = db[CmsPayment.Settings.name]
+    name_doc = await payments.find_one(
+        {"recipient_npi": request.npi, "recipient_last_name": {"$ne": None}},
+        {"_id": 0, "recipient_first_name": 1, "recipient_last_name": 1},
+    )
+    name_row = (
+        f"{name_doc.get('recipient_first_name') or ''} {name_doc['recipient_last_name']}" if name_doc else None
+    )
     name_parts = (name_row or "Unknown Recipient").split(" ", 1)
     first_name = name_parts[0]
     last_name = name_parts[1] if len(name_parts) > 1 else ""
 
     # Aggregate payment summary for the preview body.
-    agg_result = await db.execute(text("""
-        SELECT
-            COALESCE(SUM(amount_usd), 0)                         AS total_usd,
-            COUNT(DISTINCT manufacturer_id)                       AS manufacturer_count,
-            COUNT(*) FILTER (WHERE NOT is_reviewed)              AS unreviewed_count
-        FROM cms_payments
-        WHERE recipient_npi = :npi
-    """), {"npi": request.npi})
-    agg = agg_result.mappings().one_or_none() or {}
+    agg_rows = await payments.aggregate([
+        {"$match": {"recipient_npi": request.npi}},
+        {"$group": {
+            "_id": None,
+            "total_usd": {"$sum": "$amount_usd"},
+            "manufacturer_ids": {"$addToSet": "$manufacturer_id"},
+            "unreviewed_count": {"$sum": {"$cond": ["$is_reviewed", 0, 1]}},
+        }},
+        {"$project": {
+            "_id": 0, "total_usd": 1, "unreviewed_count": 1,
+            # COUNT(DISTINCT) semantics: missing manufacturer IDs are not counted.
+            "manufacturer_count": {"$size": {"$setDifference": ["$manufacturer_ids", [None]]}},
+        }},
+    ]).to_list(length=1)
+    agg = from_bson(agg_rows[0]) if agg_rows else {}
     total_usd = float(agg.get("total_usd") or 0)
     manufacturer_count = int(agg.get("manufacturer_count") or 0)
     unreviewed_count = int(agg.get("unreviewed_count") or 0)
@@ -382,11 +402,10 @@ async def campaign_dispatch(
     # A DB breach cannot reconstruct the plaintext token from its hash, so
     # stolen hashes cannot be used to forge audit portal links.
     token_hash = _resolve_token_hash(token)
-    await db.execute(text("""
-        INSERT INTO audit_tokens (token, npi, expires_at, accessed, pipeline_state)
-        VALUES (:token_hash, :npi, :expires_at, FALSE, 'dispatched')
-        ON CONFLICT (token) DO NOTHING
-    """), {"token_hash": token_hash, "npi": request.npi, "expires_at": expires_at})
+    try:
+        await AuditToken(token=token_hash, npi=request.npi, expires_at=expires_at).insert()
+    except DuplicateKeyError:
+        pass
 
     preview = build_dispatch_preview(
         npi=request.npi,
@@ -402,20 +421,19 @@ async def campaign_dispatch(
 
 @app.get("/api/campaign/stats")
 async def campaign_stats(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
     _auth: AdminAuth = None,
 ) -> dict:
     """Return live pipeline funnel counts from non-expired audit tokens. Requires admin auth."""
-    result = await db.execute(text("""
-        SELECT
-            COUNT(*) FILTER (WHERE pipeline_state = 'dispatched') AS dispatched,
-            COUNT(*) FILTER (WHERE pipeline_state = 'opened')     AS opened,
-            COUNT(*) FILTER (WHERE pipeline_state = 'disputed')   AS disputed,
-            COUNT(*) FILTER (WHERE pipeline_state = 'protected')  AS protected
-        FROM audit_tokens
-        WHERE expires_at > NOW()
-    """))
-    return dict(result.mappings().one())
+    counts = {"dispatched": 0, "opened": 0, "disputed": 0, "protected": 0}
+    rows = await db[AuditToken.Settings.name].aggregate([
+        {"$match": {"expires_at": {"$gt": datetime.now(timezone.utc)}}},
+        {"$group": {"_id": "$pipeline_state", "count": {"$sum": 1}}},
+    ]).to_list(length=None)
+    for row in rows:
+        if row["_id"] in counts:
+            counts[row["_id"]] = row["count"]
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +446,7 @@ async def campaign_stats(
 @app.get("/api/audit/{token}")
 async def get_audit_card(
     token: str,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
     """Resolve a physician audit portal token and return their payment summary.
 
@@ -441,24 +459,23 @@ async def get_audit_card(
 
     # Record 'opened' pipeline state transition on first access.
     if token_record["pipeline_state"] == "dispatched":
-        await db.execute(text("""
-            UPDATE audit_tokens
-            SET pipeline_state = 'opened', accessed = TRUE
-            WHERE token = :h
-        """), {"h": token_hash})
+        await db[AuditToken.Settings.name].update_one(
+            {"token": token_hash},
+            {"$set": {"pipeline_state": "opened", "accessed": True}},
+        )
 
     # Build physician payment summary from retained CMS records.
-    payments_result = await db.execute(text("""
-        SELECT raw_cms_record_id, payment_date, manufacturer_name, payment_type,
-               amount_usd, product_name, is_reviewed, mismatch_score,
-               recipient_first_name, recipient_last_name, recipient_specialty,
-               recipient_city, recipient_state, recipient_zip_code
-        FROM cms_payments
-        WHERE recipient_npi = :npi
-        ORDER BY payment_date DESC
-        LIMIT 200
-    """), {"npi": npi})
-    rows = [dict(r) for r in payments_result.mappings()]
+    cursor = db[CmsPayment.Settings.name].find(
+        {"recipient_npi": npi},
+        {
+            "_id": 0, "raw_cms_record_id": 1, "payment_date": 1, "manufacturer_name": 1,
+            "payment_type": 1, "amount_usd": 1, "product_name": 1, "is_reviewed": 1,
+            "mismatch_score": 1, "recipient_first_name": 1, "recipient_last_name": 1,
+            "recipient_specialty": 1, "recipient_city": 1, "recipient_state": 1,
+            "recipient_zip_code": 1,
+        },
+    ).sort("payment_date", -1).limit(200)
+    rows = [from_bson(r) for r in await cursor.to_list(length=200)]
 
     if not rows:
         raise HTTPException(status_code=404, detail="No payment records found for this audit link.")
@@ -527,7 +544,7 @@ async def get_audit_card(
 @app.post("/api/dispute/generate", status_code=status.HTTP_201_CREATED)
 async def generate_dispute(
     request: DisputeGenerateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
     """Generate a 42 CFR § 403.908 dispute notice draft for unreviewed payments.
 
@@ -546,17 +563,16 @@ async def generate_dispute(
         )
 
     # Fetch unreviewed payments eligible for dispute.
-    payments_result = await db.execute(text("""
-        SELECT raw_cms_record_id, payment_date, manufacturer_name, manufacturer_id,
-               payment_type, amount_usd, product_name,
-               recipient_first_name, recipient_last_name, recipient_specialty,
-               recipient_city, recipient_state
-        FROM cms_payments
-        WHERE recipient_npi = :npi AND NOT is_reviewed
-        ORDER BY payment_date DESC
-        LIMIT 50
-    """), {"npi": request.npi})
-    payments = [dict(r) for r in payments_result.mappings()]
+    cursor = db[CmsPayment.Settings.name].find(
+        {"recipient_npi": request.npi, "is_reviewed": {"$ne": True}},
+        {
+            "_id": 0, "raw_cms_record_id": 1, "payment_date": 1, "manufacturer_name": 1,
+            "manufacturer_id": 1, "payment_type": 1, "amount_usd": 1, "product_name": 1,
+            "recipient_first_name": 1, "recipient_last_name": 1, "recipient_specialty": 1,
+            "recipient_city": 1, "recipient_state": 1,
+        },
+    ).sort("payment_date", -1).limit(50)
+    payments = [from_bson(r) for r in await cursor.to_list(length=50)]
 
     if not payments:
         raise HTTPException(
@@ -588,11 +604,10 @@ async def generate_dispute(
     ]
 
     # Advance pipeline state to 'disputed'.
-    await db.execute(text("""
-        UPDATE audit_tokens
-        SET pipeline_state = 'disputed'
-        WHERE token = :h AND pipeline_state IN ('dispatched', 'opened')
-    """), {"h": token_hash})
+    await db[AuditToken.Settings.name].update_one(
+        {"token": token_hash, "pipeline_state": {"$in": ["dispatched", "opened"]}},
+        {"$set": {"pipeline_state": "disputed"}},
+    )
 
     return {
         "physician_name": physician_name,

@@ -39,9 +39,9 @@ export interface CmsPayment {
   product_name: string;
   product_category: string;
   reviewed: boolean;
-  mismatch_score: number; // 0.0–1.0 from pgvector cosine distance
+  mismatch_score: number; // 0.0–1.0 from Atlas Vector Search product similarity
   risk_score?: number; // non-zero only when the current Isolation Forest batch flags it
-  velocity_flag: boolean; // from TimescaleDB time_bucket surge detection
+  velocity_flag: boolean; // surge detection flag (not yet computed)
 }
 
 // ─── Explainable risk triage ────────────────────────────────────────────────
@@ -58,7 +58,7 @@ export interface RiskSignal {
 
 /** A grounded explanation returned by the backend—not free-form model output. */
 export interface RiskTriageAssessment {
-  assessment_id: number;
+  assessment_id: string;
   assessed_at: string;
   model_version: string;
   risk_score: number;
@@ -154,9 +154,6 @@ export interface Physician {
   mismatch_score: number; // max mismatch across payments
   risk_score?: number; // max current explainable triage score across payments
   risk_level: RiskLevel;
-  // Tiger Data metadata
-  timescale_latency_ms?: number;
-  pgvector_calcs?: number;
 }
 
 // ─── API Response Types ───────────────────────────────────────────────────────
@@ -164,7 +161,7 @@ export interface Physician {
 export interface DoctorListResponse {
   physicians: Physician[];
   total: number;
-  tiger_data_metrics: TigerDataMetrics;
+  db_metrics: DbMetrics;
 }
 
 export interface AuditCardData {
@@ -179,7 +176,7 @@ export interface VelocitySummary {
   month: string; // '2024-12'
   payment_count: number;
   total_amount: number;
-  is_surge: boolean; // TimescaleDB flagged
+  is_surge: boolean; // surge flagged
 }
 
 export interface ManufacturerSummary {
@@ -225,13 +222,13 @@ export interface SendAlertResponse {
   simulated: boolean;
 }
 
-// ─── Tiger Data Live Metrics ──────────────────────────────────────────────────
+// ─── Database Live Metrics ────────────────────────────────────────────────────
 
-export interface TigerDataMetrics {
-  timescale_query_ms: number;
-  pgvector_calcs: number;
-  hypertable_chunks: number;
-  vector_index_type: 'hnsw' | 'ivfflat';
+export interface DbMetrics {
+  engine: 'mongodb_atlas';
+  query_ms: number;
+  vector_scored_payments: number;
+  vector_index_type: 'atlas_vector_search';
   active_physicians: number;
   total_payments: number;
 }

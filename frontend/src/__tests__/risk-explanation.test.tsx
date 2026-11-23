@@ -4,7 +4,7 @@ import { RiskExplanationCard } from '@/components/RiskExplanationCard';
 import type { RiskTriageAssessment } from '@/lib/types';
 
 const assessment: RiskTriageAssessment = {
-  assessment_id: 7, assessed_at: '2026-09-19', model_version: 'isolation-forest-v2',
+  assessment_id: '7', assessed_at: '2026-09-19', model_version: 'isolation-forest-v2',
   risk_score: 98, risk_level: 'high_priority_review', review_recommended: true,
   plain_language_explanation: 'Stored Isolation Forest result.', signals: [],
   payment: { raw_cms_record_id: 'cms-123', payment_date: '2025-07-24' },

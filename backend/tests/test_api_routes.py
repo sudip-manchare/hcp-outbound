@@ -3,7 +3,7 @@
 External CMS/NPPES calls and the database repository are replaced at the
 application boundary.  This exercises routing, request validation, status
 codes, and error translation without requiring a live public service or a
-developer's Tiger database.
+developer's MongoDB Atlas cluster.
 """
 
 from unittest.mock import AsyncMock
@@ -70,18 +70,29 @@ def test_enrich_doctor_validates_and_translates_not_found(client, monkeypatch):
     assert client.get("/api/doctors/enrich/1234567890").status_code == 404
 
 
-def test_live_cms_preview_passes_filters_and_translates_upstream_error(client):
-    main.fetch_payments_page = AsyncMock(return_value={"payments": [], "pagination": {"next_offset": None}})
+def test_health_reports_mongodb_backed_cms_and_live_nppes(client):
+    sources = client.get("/health").json()["sources"]
+
+    assert sources["cms_open_payments"]["mode"] == "mongodb"
+    assert sources["cms_open_payments"]["collection"] == "cms_payments"
+    assert sources["nppes"]["mode"] == "live_api"
+
+
+def test_cms_payments_feed_reads_mongodb_and_never_calls_live_cms(client, monkeypatch):
+    live_cms = AsyncMock(side_effect=AssertionError("live CMS API must not be called"))
+    monkeypatch.setattr(
+        "app.services.cms_open_payments_service.fetch_payments_page", live_cms, raising=True,
+    )
+    main.query_cms_payments_page = AsyncMock(return_value={"payments": [], "pagination": {"next_offset": None}})
 
     response = client.get("/api/payments?limit=10&offset=4&recipient_state=oh&payment_nature=Food")
     assert response.status_code == 200
-    assert main.fetch_payments_page.await_args.kwargs == {
+    assert main.query_cms_payments_page.await_args.kwargs == {
         "limit": 10, "offset": 4, "recipient_state": "oh", "manufacturer_id": None,
         "payment_nature": "Food", "recipient_type": None,
     }
-
-    main.fetch_payments_page = AsyncMock(side_effect=CMSOpenPaymentsServiceError("down"))
-    assert client.get("/api/payments").status_code == 502
+    assert not hasattr(main, "fetch_payments_page")
+    live_cms.assert_not_awaited()
 
 
 def test_cms_ingestion_validates_input_and_returns_created_result(client):
@@ -96,6 +107,9 @@ def test_cms_ingestion_validates_input_and_returns_created_result(client):
         "limit": 20, "offset": 5, "recipient_state": "OH", "manufacturer_id": None,
         "payment_nature": None, "recipient_type": None,
     }
+
+    main.ingest_cms_page = AsyncMock(side_effect=CMSOpenPaymentsServiceError("down"))
+    assert client.post("/api/ingestions/cms", json={"limit": 20}).status_code == 502
 
 
 def test_stored_payment_collection_and_detail_routes(client):
@@ -162,7 +176,7 @@ def test_stored_payment_delete_returns_no_content_or_not_found(client):
 
 
 def test_review_queue_returns_repository_response(client):
-    main.list_review_queue = AsyncMock(return_value={"physicians": [], "total": 0, "tiger_data_metrics": {}})
+    main.list_review_queue = AsyncMock(return_value={"physicians": [], "total": 0, "db_metrics": {}})
 
     response = client.get("/api/doctors")
     assert response.status_code == 200

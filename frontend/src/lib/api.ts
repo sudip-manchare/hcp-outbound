@@ -157,7 +157,7 @@ export function deleteStoredPayment(recordId: string, paymentDate: string): Prom
   return apiFetch<void>(`/api/stored-payments/${encodeURIComponent(recordId)}?${query}`, { method: 'DELETE' });
 }
 
-/** Pull one bounded, current CMS page into Tiger Data. */
+/** Pull one bounded, current CMS page into MongoDB. */
 export async function pullLatestCmsData(): Promise<CmsIngestionResult> {
   return apiFetch<CmsIngestionResult>('/api/ingestions/cms', {
     method: 'POST',

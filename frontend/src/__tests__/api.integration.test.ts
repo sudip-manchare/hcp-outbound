@@ -46,7 +46,7 @@ describe('frontend API contract integration', () => {
 
   it('uses the local queue and normalizes the actual NPPES provider response for the UI', async () => {
     fetchMock
-      .mockResolvedValueOnce(jsonResponse({ physicians: [], total: 0, tiger_data_metrics: {} }))
+      .mockResolvedValueOnce(jsonResponse({ physicians: [], total: 0, db_metrics: {} }))
       .mockResolvedValueOnce(jsonResponse({
         source: { retrieved_at: '2026-09-19T12:00:00Z' }, npi: '1234567890', status: 'A',
         legal_name: { first_name: 'Ada', last_name: 'Lovelace', credential: 'MD', organization_name: null },
@@ -75,8 +75,8 @@ describe('frontend API contract integration', () => {
       .mockResolvedValueOnce(jsonResponse({ run_id: 1, records_seen: 1, records_inserted: 1, records_skipped: 0, risk_assessments_invalidated: 0, pagination: { next_offset: null } }, 201))
       .mockResolvedValueOnce(jsonResponse({ records: [payment], pagination: { limit: 10, offset: 0, total_records: 1, returned_records: 1, next_offset: null } }))
       .mockResolvedValueOnce(jsonResponse(payment))
-      .mockResolvedValueOnce(jsonResponse({ assessment_id: 2, signals: [] }, 201))
-      .mockResolvedValueOnce(jsonResponse({ assessment_id: 2, signals: [] }))
+      .mockResolvedValueOnce(jsonResponse({ assessment_id: '2', signals: [] }, 201))
+      .mockResolvedValueOnce(jsonResponse({ assessment_id: '2', signals: [] }))
       .mockResolvedValueOnce({ ok: true, status: 204, text: vi.fn(), json: vi.fn() } as unknown as Response);
 
     await pullLatestCmsData();

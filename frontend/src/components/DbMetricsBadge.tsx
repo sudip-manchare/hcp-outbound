@@ -3,10 +3,10 @@
 import { useEffect, useState } from 'react';
 import { clsx } from 'clsx';
 import { Database, Zap } from 'lucide-react';
-import type { TigerDataMetrics } from '@/lib/types';
+import type { DbMetrics } from '@/lib/types';
 
-interface TigerDataBadgeProps {
-  metrics: TigerDataMetrics;
+interface DbMetricsBadgeProps {
+  metrics: DbMetrics;
   className?: string;
 }
 
@@ -28,7 +28,7 @@ function Ticker({ value, suffix }: { value: number; suffix: string }) {
   );
 }
 
-export function TigerDataBadge({ metrics, className }: TigerDataBadgeProps) {
+export function DbMetricsBadge({ metrics, className }: DbMetricsBadgeProps) {
   return (
     <div
       className={clsx(
@@ -40,18 +40,18 @@ export function TigerDataBadge({ metrics, className }: TigerDataBadgeProps) {
       <div className="flex items-center gap-1.5">
         <div className="tiger-dot animate-pulse-glow" />
         <Database size={13} className="text-orange-400" />
-        <span className="text-xs font-medium text-[#a4511e]">Tiger Data</span>
+        <span className="text-xs font-medium text-[#a4511e]">MongoDB Atlas</span>
       </div>
       <div className="h-3 w-px bg-[#ecd2be]" />
       <div className="flex items-center gap-1 text-xs">
         <Zap size={11} className="text-[#bd7c1d]" />
-        <Ticker value={metrics.timescale_query_ms} suffix="ms" />
-        <span className="text-[var(--c-text-muted)]">TS</span>
+        <Ticker value={metrics.query_ms} suffix="ms" />
+        <span className="text-[var(--c-text-muted)]">query</span>
       </div>
       <div className="h-3 w-px bg-[#ecd2be]" />
       <div className="flex items-center gap-1 text-xs">
-        <span className="text-[#0b3655] font-mono font-bold">{metrics.pgvector_calcs.toLocaleString()}</span>
-        <span className="text-[var(--c-text-muted)]">vec calcs</span>
+        <span className="text-[#0b3655] font-mono font-bold">{metrics.vector_scored_payments.toLocaleString()}</span>
+        <span className="text-[var(--c-text-muted)]">vector scored</span>
       </div>
     </div>
   );

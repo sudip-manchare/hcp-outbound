@@ -1,39 +1,81 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
+"""MongoDB (motor + beanie) connection management."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
+from typing import Any
+
+from beanie import init_beanie
+from bson import Decimal128
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+
 from app.core.config import get_settings
+from app.models.documents import DOCUMENT_MODELS
 
-settings = get_settings()
-
-# ---------------------------------------------------------------------------
-# Async engine — used by all FastAPI request handlers
-# ---------------------------------------------------------------------------
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    pool_size=10,
-    max_overflow=20,
-    echo=settings.APP_ENV == "development",
-)
-
-AsyncSessionLocal = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+_client: AsyncIOMotorClient | None = None
+_database: AsyncIOMotorDatabase | None = None
+_init_lock = asyncio.Lock()
 
 
-class Base(DeclarativeBase):
-    """Declarative base for all ORM models."""
-    pass
+def create_client(uri: str | None = None) -> AsyncIOMotorClient:
+    # tz_aware keeps every datetime read back from MongoDB in UTC.
+    return AsyncIOMotorClient(uri or get_settings().MONGODB_URI, tz_aware=True)
 
 
-async def get_db() -> AsyncSession:
-    """FastAPI dependency that yields a DB session and closes it after the request."""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+async def init_db(
+    client: AsyncIOMotorClient | None = None,
+    db_name: str | None = None,
+) -> AsyncIOMotorDatabase:
+    """Connect once per process and register beanie models (creates indexes)."""
+    global _client, _database
+    async with _init_lock:
+        if _database is None or client is not None:
+            new_client = client or create_client()
+            database = new_client[db_name or get_settings().MONGODB_DB_NAME]
+            try:
+                await init_beanie(database=database, document_models=DOCUMENT_MODELS)
+            except Exception:
+                if client is None:
+                    new_client.close()
+                raise
+            # Publish only after beanie is ready so a failure is retried next request.
+            _client, _database = new_client, database
+    return _database
+
+
+async def close_db() -> None:
+    global _client, _database
+    if _client is not None:
+        _client.close()
+    _client = _database = None
+
+
+async def get_db() -> AsyncIterator[AsyncIOMotorDatabase]:
+    """FastAPI dependency yielding the initialized MongoDB database."""
+    yield await init_db() if _database is None else _database
+
+
+def from_bson(value: Any) -> Any:
+    """Convert BSON-only scalars (Decimal128) returned by raw motor queries."""
+    if isinstance(value, Decimal128):
+        return value.to_decimal()
+    if isinstance(value, dict):
+        return {key: from_bson(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [from_bson(item) for item in value]
+    return value
+
+
+def to_decimal128(value: Any) -> Decimal128 | None:
+    if value in (None, ""):
+        return None
+    return Decimal128(Decimal(str(value)))
+
+
+def payment_day_filter(record_id: str, payment_date: date) -> dict[str, Any]:
+    """Match a CMS source record on its calendar payment date (UTC)."""
+    start = datetime.combine(payment_date, time.min, tzinfo=timezone.utc)
+    return {"raw_cms_record_id": record_id, "payment_date": {"$gte": start, "$lt": start + timedelta(days=1)}}

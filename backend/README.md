@@ -18,44 +18,53 @@ upstream availability. Environment files are excluded from the image.
 
 For hosted deployment, set these runtime environment variables:
 
-- `DATABASE_URL`: async PostgreSQL connection (`postgresql+asyncpg://...`).
-- `DATABASE_URL_SYNC`: PostgreSQL connection for administrative scripts.
+- `MONGODB_URI`: MongoDB Atlas connection string (`mongodb+srv://...`).
+- `MONGODB_DB_NAME`: database name (default `hcp_outbound`).
 - `CMS_OPEN_PAYMENTS_GENERAL_DATASET_ID`: required; see `.env.example`.
 - `APP_ENV=production` and a production `SECRET_KEY`.
 - `CORS_ORIGINS=["https://your-frontend.example.com"]`: JSON array of allowed
   frontend origins, without paths or trailing slashes. Restart after changing it.
 - `GEMINI_API_KEY`: optional, enables AI explanations; keep it on the backend.
 
-Use an external Tiger Data/PostgreSQL database with TimescaleDB and pgvector.
+Use a MongoDB Atlas cluster (Atlas Vector Search is required for specialty
+mismatch scoring). In Atlas, create a database user and allow your host's IP
+under Network Access, then put the connection string in `backend/.env`.
 For a new database, run the initializer once before using ingestion:
 
 ```bash
 docker run --rm --env-file backend/.env falsepay-backend \
-  python -m scripts.init_tiger_db
+  python -m scripts.init_mongo_db
 ```
+
+It creates the `physicians`, `cms_payments`, `disputes`, `audit_tokens`,
+`cms_ingestion_runs`, and `risk_assessments` collections; the unique
+`(raw_cms_record_id, payment_date)` index; a TTL index that deletes
+`audit_tokens` once `expires_at` passes; and the Atlas Vector Search index
+`cms_payments_product_embedding` (384 dimensions, cosine similarity). The
+command waits until the vector index is queryable.
 
 Database initialization is an explicit administrative step, not a container
 startup action. Do not use `localhost` as the database host inside a container
 unless the database actually shares its network namespace.
 
-## Live sources
+## Data sources
 
-The backend now uses two mandatory, public CMS APIs for live provider profiles:
+- NPPES NPI Registry (live API call per request): `GET /api/doctors/enrich/{npi}`
+- CMS Open Payments General Payments (served from MongoDB): `GET /api/payments?limit=100&offset=0`
 
-- NPPES NPI Registry: `GET /api/doctors/enrich/{npi}`
-- CMS Open Payments General Payments datastore: `GET /api/payments?limit=100&offset=0`
-
-Start it from `backend/` with `uvicorn app.main:app --reload`. CMS is a generic page feed; each payment includes its recipient NPI. Select a record, then call NPPES only for the provider you want to inspect. Neither endpoint returns seed data.
+Start it from `backend/` with `uvicorn app.main:app --reload`. Request handlers never call the CMS API; `GET /api/payments` pages through the `cms_payments` collection with the same response shape and filters (`recipient_state`, `manufacturer_id`, `payment_nature`, `recipient_type`). CMS data reaches MongoDB only through the ingestion script or `POST /api/ingestions/cms`. Each payment includes its recipient NPI; call NPPES only for the provider you want to inspect. Neither endpoint returns seed data.
 
 CMS publishes a new Open Payments dataset identifier each reporting year. Update `CMS_OPEN_PAYMENTS_GENERAL_DATASET_ID` and `CMS_OPEN_PAYMENTS_PROGRAM_YEAR` together after checking the official `https://openpaymentsdata.cms.gov/data.json` catalog. The current defaults target program year 2025.
 
 ## Database ingestion
 
-The generic CMS API response can be retained in Tiger Data with its complete raw record and a normalized set of queryable columns. The one-page pilot below ingests 100 live records; it does not attempt the 16-million-row annual dataset in one unbounded job.
+The generic CMS API response is retained in MongoDB with its complete raw record and a normalized set of queryable fields. The default run is a one-time load of 10 pages × 100 = 1,000 live records; it does not attempt the 16-million-row annual dataset in one unbounded job, and it does not pre-fetch NPPES.
 
 ```bash
-python scripts/ingest_cms_open_payments.py --reset --pages 1 --page-size 100
+python -m scripts.ingest_cms_open_payments --reset
 ```
+
+Records are written with motor bulk upserts (`$setOnInsert`) keyed on `(raw_cms_record_id, payment_date)`, so re-running never overwrites an existing local copy. Each payment stores a 384-dimension `product_embedding`. After loading, the script computes specialty-mismatch scores with Atlas `$vectorSearch` (the share of similar-product payments received by other specialties) and then retrains the Isolation Forest.
 
 `cms_ingestion_runs` records the source dataset, filters, offset, and result count for each run. To continue, use a later `--start-offset`; to ingest a narrower cohort, use `--recipient-state OH`. A payment record keeps its `recipient_npi`, and NPPES enrichment remains an explicit later step for the providers selected from that feed.
 
@@ -70,7 +79,7 @@ Content-Type: application/json
 { "limit": 100, "offset": 0 }
 ```
 
-That one call first reads the page from the official CMS API, then creates only the new rows in Tiger Data in the same backend request. Its response includes `records_seen`, `records_inserted`, `records_skipped`, and `next_offset`, so the button can report exactly what happened. `GET /api/payments` remains available as a CMS-only preview endpoint.
+That one call first reads the page from the official CMS API, then creates only the new documents in MongoDB in the same backend request. Its response includes `records_seen`, `records_inserted`, `records_skipped`, and `next_offset`, so the button can report exactly what happened. `GET /api/payments` reads the retained data from MongoDB.
 
 ## Local CMS record CRUD
 
@@ -105,16 +114,18 @@ bounded review queue for each batch. An observation describes a value fed to the
 it does not claim to be the cause of a prediction. The system only prioritizes
 human review and never determines fraud or wrongdoing.
 
-Every model result is retained in `risk_assessments` and `risk_signals`. A new
+Every model result is retained in `risk_assessments`, with its observations embedded
+as `risk_signals`; the current score is also copied onto each `cms_payments` document
+(`current_risk_score`) so the review queue needs no join. A new
 ingestion marks the prior batch stale, preserves it as audit history, retrains
 the model, and persists a new current result for every retained payment. `GET`
 on the same risk-triage URL reads that current stored result without re-scoring.
 
 CLI ingestion also scores the complete retained dataset before reporting success.
 To backfill older ingestions or refresh the model without fetching CMS data, run
-`python -m scripts.score_cms_payments` from `backend/`. This uses
-`DATABASE_URL_SYNC`, like CLI ingestion, and replaces current assessments in one
-transaction while preserving their history. Reload the frontend afterward to
+`python -m scripts.score_cms_payments` from `backend/`. It embeds any payments
+missing a vector, refreshes Atlas Vector Search mismatch scores, and replaces
+current assessments while preserving their history. Reload the frontend afterward to
 fetch the updated review queue.
 
 ## Gemini explanations
