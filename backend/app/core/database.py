@@ -33,9 +33,16 @@ async def init_db(
     global _client, _database
     async with _init_lock:
         if _database is None or client is not None:
-            _client = client or create_client()
-            _database = _client[db_name or get_settings().MONGODB_DB_NAME]
-            await init_beanie(database=_database, document_models=DOCUMENT_MODELS)
+            new_client = client or create_client()
+            database = new_client[db_name or get_settings().MONGODB_DB_NAME]
+            try:
+                await init_beanie(database=database, document_models=DOCUMENT_MODELS)
+            except Exception:
+                if client is None:
+                    new_client.close()
+                raise
+            # Publish only after beanie is ready so a failure is retried next request.
+            _client, _database = new_client, database
     return _database
 
 
