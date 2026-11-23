@@ -68,12 +68,14 @@ async def ingest(args, db: AsyncIOMotorDatabase | None = None) -> dict:
         ).insert()
 
         pages = [first_page]
-        for page_number in range(1, args.pages):
-            if pages[-1]["pagination"].get("next_offset") is None:
+        for _ in range(1, args.pages):
+            # Follow CMS's next_offset: it may cap the page below page_size.
+            next_offset = pages[-1]["pagination"].get("next_offset")
+            if next_offset is None:
                 break
             pages.append(await fetch_raw_payments_page(
                 limit=args.page_size,
-                offset=args.start_offset + page_number * args.page_size,
+                offset=next_offset,
                 recipient_state=args.recipient_state,
             ))
 
