@@ -9,6 +9,7 @@ import pytest
 from mongomock_motor import AsyncMongoMockClient
 
 from app.core import database
+from app.core.config import get_settings
 from app.models.documents import AuditToken, CmsPayment
 from app.services import cms_payment_repository as repository
 from app.services import risk_triage_service as triage
@@ -16,7 +17,10 @@ from app.services.embedding_service import embed_text
 from app.services.vector_mismatch_service import mismatch_from_neighbours, vector_search_pipeline
 from scripts import ingest_cms_open_payments as cli
 
-SOURCE = {"name": "CMS Open Payments", "url": "https://example.test/api", "dataset_id": "cms", "program_year": 2025}
+SOURCE = {
+    "name": "CMS Open Payments", "url": "https://example.test/api",
+    "dataset_id": get_settings().CMS_OPEN_PAYMENTS_GENERAL_DATASET_ID, "program_year": 2025,
+}
 
 
 def raw_record(index: int, **overrides) -> dict:
@@ -73,6 +77,12 @@ def test_payment_document_preserves_generic_recipient_raw_record_and_embedding()
     assert document["raw_cms_payload"]["record_id"] == "cms-1"
     assert document["ingestion_run_id"] == "run-7"
     assert len(document["product_embedding"]) == 384
+    assert document["source_dataset_id"] == SOURCE["dataset_id"]
+
+
+def test_productless_payment_gets_no_embedding():
+    record = raw_record(1, name_of_drug_or_biological_or_device_or_medical_supply_1="")
+    assert repository.payment_document(record, SOURCE, None)["product_embedding"] is None
 
 
 def test_embeddings_are_384_dim_unit_vectors_and_empty_text_has_none():
@@ -128,6 +138,19 @@ def test_payments_feed_is_served_from_mongodb_with_filters_and_count(db):
     assert result["payments"][0]["recipient"]["state"] == "OH"
 
 
+def test_payments_feed_excludes_other_datasets(db):
+    collection = db.db[CmsPayment.Settings.name]
+    old_source = {**SOURCE, "dataset_id": "previous-year-dataset"}
+    db.run(repository.upsert_payments(collection, [
+        repository.payment_document(raw_record(1), SOURCE, None),
+        repository.payment_document(raw_record(2), old_source, None),
+    ]))
+
+    result = db.run(repository.query_cms_payments_page(db.db, limit=10, offset=0))
+    assert result["pagination"]["total_matching_records"] == 1
+    assert [payment["record_id"] for payment in result["payments"]] == ["cms-1"]
+
+
 def test_review_queue_joins_current_risk_assessment_and_reports_db_metrics(db):
     collection = db.db[CmsPayment.Settings.name]
     db.run(repository.upsert_payments(collection, [
@@ -161,6 +184,8 @@ def test_local_review_update_and_delete_match_calendar_payment_date(db):
         db.db, record_id="cms-3", payment_date=date(2025, 7, 4), is_reviewed=True, mismatch_score=0.4,
     ))
     assert updated["is_reviewed"] is True and updated["mismatch_score"] == 0.4
+    stored = db.run(db.db[CmsPayment.Settings.name].find_one({"raw_cms_record_id": "cms-3"}))
+    assert stored["mismatch_score_manual"] is True
     assert db.run(repository.get_payment(db.db, "cms-3", date(2025, 7, 5))) is None
     assert db.run(repository.delete_payment(db.db, "cms-3", date(2025, 7, 4))) is True
     assert db.run(repository.delete_payment(db.db, "cms-3", date(2025, 7, 4))) is False

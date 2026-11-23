@@ -65,6 +65,8 @@ class CmsPayment(Document):
     product_embedding: list[float] | None = None
     # Share of similar-product payments (Atlas $vectorSearch) received by other specialties.
     mismatch_score: float | None = None
+    # Set when a reviewer PATCHes mismatch_score; vector scoring then skips the payment.
+    mismatch_score_manual: bool = False
     # Embedded copy of the current risk_assessments score (replaces a per-row join).
     current_risk_score: int | None = None
     current_risk_model_version: str | None = None
@@ -75,6 +77,7 @@ class CmsPayment(Document):
     change_type: str | None = None
     cms_program_year: int | None = None
     source_url: str | None = None
+    source_dataset_id: str | None = None
     source_fetched_at: datetime | None = None
     raw_cms_payload: dict[str, Any] | None = None
     ingestion_run_id: PydanticObjectId | None = None

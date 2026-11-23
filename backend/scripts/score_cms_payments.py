@@ -15,7 +15,7 @@ from pymongo import UpdateOne
 
 from app.core.database import close_db, init_db
 from app.models.documents import CmsPayment
-from app.services.embedding_service import embed_text, payment_embedding_text
+from app.services.embedding_service import embed_text
 from app.services.risk_triage_service import run_isolation_forest_triage
 from app.services.vector_mismatch_service import score_specialty_mismatch
 
@@ -24,12 +24,12 @@ async def embed_missing_payments(db: AsyncIOMotorDatabase) -> int:
     """Store 384-dim product embeddings for payments that do not have one yet."""
     collection = db[CmsPayment.Settings.name]
     rows = await collection.find(
-        {"product_embedding": None}, {"_id": 1, "product_name": 1, "payment_type": 1},
+        {"product_embedding": None}, {"_id": 1, "product_name": 1},
     ).to_list(length=None)
     updates = [
         UpdateOne({"_id": row["_id"]}, {"$set": {"product_embedding": vector}})
         for row in rows
-        if (vector := embed_text(payment_embedding_text(row.get("product_name"), row.get("payment_type"))))
+        if (vector := embed_text(row.get("product_name")))
     ]
     if updates:
         await collection.bulk_write(updates, ordered=False)

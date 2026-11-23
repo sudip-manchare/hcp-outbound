@@ -32,8 +32,13 @@ VECTOR_INDEX_DEFINITION = {
         "path": "product_embedding",
         "numDimensions": EMBEDDING_DIM,
         "similarity": "cosine",
+    }, {
+        "type": "filter",
+        "path": "_id",
     }],
 }
+INDEX_CATCH_UP_SAMPLE = 20
+INDEX_CATCH_UP_TIMEOUT_SECONDS = 120.0
 
 
 def vector_search_pipeline(query_vector: list[float]) -> list[dict[str, Any]]:
@@ -62,6 +67,44 @@ def mismatch_from_neighbours(payment: dict[str, Any], neighbours: list[dict[str,
     return round(different / total, 4)
 
 
+async def wait_for_index_catch_up(
+    collection: Any,
+    *,
+    timeout: float = INDEX_CATCH_UP_TIMEOUT_SECONDS,
+    interval: float = 2.0,
+) -> bool:
+    """Wait until the newest embedded payments are searchable.
+
+    Atlas Search indexes asynchronously, so vectors written by an ingestion
+    may not be queryable yet. An exact search restricted to the newest
+    ``_id`` values must return all of them before scoring proceeds.
+    """
+    newest = await collection.find(
+        {"product_embedding": {"$ne": None}}, {"_id": 1, "product_embedding": 1},
+    ).sort("_id", -1).limit(INDEX_CATCH_UP_SAMPLE).to_list(length=INDEX_CATCH_UP_SAMPLE)
+    if not newest:
+        return True
+    ids = [row["_id"] for row in newest]
+    pipeline = [
+        {"$vectorSearch": {
+            "index": PAYMENT_VECTOR_INDEX,
+            "path": "product_embedding",
+            "queryVector": newest[0]["product_embedding"],
+            "exact": True,
+            "limit": len(ids),
+            "filter": {"_id": {"$in": ids}},
+        }},
+        {"$project": {"_id": 1}},
+    ]
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if len(await collection.aggregate(pipeline).to_list(length=None)) == len(ids):
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(interval)
+
+
 async def score_specialty_mismatch(db: AsyncIOMotorDatabase) -> dict[str, Any]:
     """Recompute ``mismatch_score`` for every embedded payment with a specialty.
 
@@ -69,8 +112,20 @@ async def score_specialty_mismatch(db: AsyncIOMotorDatabase) -> dict[str, Any]:
     the Atlas Vector Search index is missing (e.g. local MongoDB).
     """
     collection = db[CmsPayment.Settings.name]
+    try:
+        caught_up = await wait_for_index_catch_up(collection)
+    except (OperationFailure, NotImplementedError) as exc:
+        logger.warning("Atlas Vector Search unavailable; mismatch scores unchanged: %s", exc)
+        return {"status": "vector_index_unavailable", "payments_scored": 0}
+    if not caught_up:
+        logger.warning("Atlas Vector Search index has not caught up; mismatch scores unchanged")
+        return {"status": "vector_index_lagging", "payments_scored": 0}
     payments = await collection.find(
-        {"product_embedding": {"$ne": None}, "recipient_specialty": {"$ne": None}},
+        {
+            "product_embedding": {"$ne": None},
+            "recipient_specialty": {"$ne": None},
+            "mismatch_score_manual": {"$ne": True},
+        },
         {"_id": 1, "recipient_specialty": 1, "product_embedding": 1},
     ).to_list(length=None)
     if not payments:

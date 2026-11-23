@@ -29,6 +29,3 @@ def embed_text(text: str | None) -> list[float] | None:
     norm = np.linalg.norm(vector)
     return (vector / norm).round(6).tolist() if norm else None
 
-
-def payment_embedding_text(product_name: str | None, payment_type: str | None) -> str:
-    return " ".join(part for part in (product_name, payment_type) if part)

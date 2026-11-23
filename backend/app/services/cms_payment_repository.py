@@ -16,7 +16,7 @@ from pymongo import ReturnDocument, UpdateOne
 from app.core.config import get_settings
 from app.core.database import from_bson, payment_day_filter, to_decimal128
 from app.models.documents import CmsIngestionRun, CmsPayment, utcnow
-from app.services.embedding_service import embed_text, payment_embedding_text
+from app.services.embedding_service import embed_text
 from app.services.cms_open_payments_service import fetch_raw_payments_page, normalize_payment
 from app.services.vector_mismatch_service import score_specialty_mismatch
 from app.services.risk_triage_service import MODEL_VERSION, run_isolation_forest_triage
@@ -62,6 +62,7 @@ def payment_document(record: dict[str, Any], source: dict[str, Any], run_id: Any
         record.get(f"name_of_drug_or_biological_or_device_or_medical_supply_{index}")
         for index in range(1, 6)
     ]
+    product_name = next((product for product in products if product), None)
     return {
         "recipient_npi": record.get("covered_recipient_npi") or None,
         "recipient_profile_id": record.get("covered_recipient_profile_id") or None,
@@ -76,18 +77,17 @@ def payment_document(record: dict[str, Any], source: dict[str, Any], run_id: Any
         "payment_date": _cms_datetime(record.get("date_of_payment")),
         "manufacturer_name": record.get("applicable_manufacturer_or_applicable_gpo_making_payment_name") or "Unknown reporting entity",
         "manufacturer_id": record.get("applicable_manufacturer_or_applicable_gpo_making_payment_id") or None,
-        "product_name": next((product for product in products if product), None),
+        "product_name": product_name,
         "payment_type": record.get("nature_of_payment_or_transfer_of_value") or None,
         "payment_form": record.get("form_of_payment_or_transfer_of_value") or None,
         "payment_count": int(record.get("number_of_payments_included_in_total_amount") or 1),
         "amount_usd": to_decimal128(record.get("total_amount_of_payment_usdollars")),
         "is_reviewed": False,
         "dispute_id": None,
-        "product_embedding": embed_text(payment_embedding_text(
-            next((product for product in products if product), None),
-            record.get("nature_of_payment_or_transfer_of_value"),
-        )),
+        # Only product evidence is embedded; productless payments get no vector.
+        "product_embedding": embed_text(product_name),
         "mismatch_score": None,
+        "mismatch_score_manual": False,
         "current_risk_score": None,
         "current_risk_model_version": None,
         "raw_cms_record_id": record.get("record_id"),
@@ -97,6 +97,7 @@ def payment_document(record: dict[str, Any], source: dict[str, Any], run_id: Any
         "change_type": record.get("change_type") or None,
         "cms_program_year": int(record.get("program_year") or source["program_year"]),
         "source_url": source["url"],
+        "source_dataset_id": source["dataset_id"],
         "source_fetched_at": utcnow(),
         "raw_cms_payload": record,
         "ingestion_run_id": run_id,
@@ -210,7 +211,8 @@ async def query_cms_payments_page(
         "payment_nature": ("payment_type", payment_nature),
         "recipient_type": ("recipient_type", recipient_type),
     }
-    query: dict[str, Any] = {}
+    # Serve only the configured dataset, matching the source label below.
+    query: dict[str, Any] = {"source_dataset_id": settings.CMS_OPEN_PAYMENTS_GENERAL_DATASET_ID}
     applied_filters: dict[str, str] = {}
     for name, (field, value) in filters.items():
         if value is not None:
@@ -404,6 +406,7 @@ async def update_local_review(
         updates["is_reviewed"] = is_reviewed
     if mismatch_score is not UNSET:
         updates["mismatch_score"] = mismatch_score
+        updates["mismatch_score_manual"] = True  # vector rescoring must not overwrite it
     if not updates:
         raise ValueError("Provide is_reviewed and/or mismatch_score.")
 
