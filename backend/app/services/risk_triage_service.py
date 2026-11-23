@@ -208,7 +208,10 @@ def _assessment_document(payment: dict[str, Any], assessment: dict[str, Any]) ->
     ).model_dump(by_alias=True, exclude={"id", "revision_id"}, exclude_none=False)
 
 
-async def run_isolation_forest_triage(db: AsyncIOMotorDatabase) -> dict[str, int | str]:
+async def run_isolation_forest_triage(
+    db: AsyncIOMotorDatabase,
+    invalidated_by_ingestion_run_id: Any = None,
+) -> dict[str, int | str]:
     """Fit the model to the current dataset and persist its complete batch output."""
     import asyncio
     from datetime import datetime, timezone
@@ -218,13 +221,12 @@ async def run_isolation_forest_triage(db: AsyncIOMotorDatabase) -> dict[str, int
     # Offload to a thread pool so other API requests can proceed meanwhile.
     loop = asyncio.get_running_loop()
     assessments = await loop.run_in_executor(None, score_payments, payments)
-    # Support an explicit re-run after a model-version change as well as the
-    # normal ingestion lifecycle, which performs this invalidation first.
+    # Retire the previous batch (kept for audit) only once the new one is scored.
     collection = db["risk_assessments"]
-    await collection.update_many(
-        {"is_current": True},
-        {"$set": {"is_current": False, "invalidated_at": datetime.now(timezone.utc)}},
-    )
+    invalidation: dict[str, Any] = {"is_current": False, "invalidated_at": datetime.now(timezone.utc)}
+    if invalidated_by_ingestion_run_id is not None:
+        invalidation["invalidated_by_ingestion_run_id"] = invalidated_by_ingestion_run_id
+    invalidated = await collection.update_many({"is_current": True}, {"$set": invalidation})
     documents = [
         _assessment_document(payment, assessment)
         for payment, assessment in zip(payments, assessments, strict=True)
@@ -242,6 +244,7 @@ async def run_isolation_forest_triage(db: AsyncIOMotorDatabase) -> dict[str, int
     return {
         "records_scored": len(assessments),
         "records_flagged": sum(item["review_recommended"] for item in assessments),
+        "records_invalidated": invalidated.modified_count,
         "model_version": MODEL_VERSION,
     }
 

@@ -15,7 +15,7 @@ from pymongo import ReturnDocument, UpdateOne
 
 from app.core.config import get_settings
 from app.core.database import from_bson, payment_day_filter, to_decimal128
-from app.models.documents import CmsIngestionRun, CmsPayment, RiskAssessment, utcnow
+from app.models.documents import CmsIngestionRun, CmsPayment, utcnow
 from app.services.embedding_service import embed_text, payment_embedding_text
 from app.services.cms_open_payments_service import fetch_raw_payments_page, normalize_payment
 from app.services.vector_mismatch_service import score_specialty_mismatch
@@ -152,17 +152,6 @@ async def ingest_cms_page(
         page_size=page["pagination"]["limit"],
         pages_requested=1,
     ).insert()
-    # A new source snapshot can change the comparison population and the CMS
-    # record itself. Keep prior results for audit, but never present them as
-    # current after the next ingestion begins.
-    invalidated = await db[RiskAssessment.Settings.name].update_many(
-        {"is_current": True},
-        {"$set": {"is_current": False, "invalidated_by_ingestion_run_id": run.id, "invalidated_at": utcnow()}},
-    )
-    await _payments(db).update_many(
-        {"current_risk_score": {"$ne": None}},
-        {"$set": {"current_risk_score": None, "current_risk_model_version": None}},
-    )
     inserted = await upsert_payments(
         _payments(db), [payment_document(record, source, run.id) for record in page["records"]],
     )
@@ -171,7 +160,9 @@ async def ingest_cms_page(
     await score_specialty_mismatch(db)
     # Train a fresh vanilla Isolation Forest on this new retained snapshot so
     # the re-rendered queue already contains current anomaly results.
-    triage = await run_isolation_forest_triage(db)
+    # Prior results stay current until the new batch is ready, so a failed
+    # import never leaves the queue without scores.
+    triage = await run_isolation_forest_triage(db, invalidated_by_ingestion_run_id=run.id)
 
     seen = len(page["records"])
     run.records_ingested = run.records_inserted = inserted
@@ -188,7 +179,7 @@ async def ingest_cms_page(
         "records_seen": seen,
         "records_inserted": inserted,
         "records_skipped": seen - inserted,
-        "risk_assessments_invalidated": invalidated.modified_count,
+        "risk_assessments_invalidated": triage["records_invalidated"],
         "risk_assessments_created": triage["records_scored"],
         "risk_assessments_flagged": triage["records_flagged"],
         "risk_model_version": triage["model_version"],
