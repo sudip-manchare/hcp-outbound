@@ -10,13 +10,15 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from datetime import timedelta
-import json
 from typing import Any
 
 import numpy as np
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import UpdateOne
 from sklearn.ensemble import IsolationForest
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import from_bson, payment_day_filter
+from app.models.documents import RiskAssessment, RiskSignal
 
 
 MODEL_VERSION = "isolation-forest-v2"
@@ -173,72 +175,70 @@ def score_payments(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return assessments
 
 
-async def _load_payment(db: AsyncSession, record_id: str, payment_date: Any) -> dict[str, Any] | None:
-    result = await db.execute(text("""
-        SELECT raw_cms_record_id, payment_date, recipient_npi, recipient_specialty,
-               manufacturer_name, product_name, payment_type, payment_count,
-               amount_usd, mismatch_score
-        FROM cms_payments
-        WHERE raw_cms_record_id = :record_id AND payment_date::date = :payment_date
-    """), {"record_id": record_id, "payment_date": payment_date})
-    row = result.mappings().one_or_none()
-    return dict(row) if row else None
+PAYMENT_FEATURE_PROJECTION = {
+    "_id": 0, "raw_cms_record_id": 1, "payment_date": 1, "recipient_npi": 1,
+    "recipient_specialty": 1, "manufacturer_name": 1, "product_name": 1,
+    "payment_type": 1, "payment_count": 1, "amount_usd": 1, "mismatch_score": 1,
+}
 
 
-async def _load_all_payments(db: AsyncSession) -> list[dict[str, Any]]:
-    result = await db.execute(text("""
-        SELECT raw_cms_record_id, payment_date, recipient_npi, recipient_specialty,
-               manufacturer_name, product_name, payment_type, payment_count,
-               amount_usd, mismatch_score
-        FROM cms_payments
-        ORDER BY payment_date, raw_cms_record_id
-    """))
-    return [dict(row) for row in result.mappings()]
+async def _load_payment(db: AsyncIOMotorDatabase, record_id: str, payment_date: Any) -> dict[str, Any] | None:
+    row = await db["cms_payments"].find_one(payment_day_filter(record_id, payment_date), PAYMENT_FEATURE_PROJECTION)
+    return from_bson(row) if row else None
 
 
-async def _store_assessment(db: AsyncSession, payment: dict[str, Any], assessment: dict[str, Any]) -> None:
-    evidence = {"model": assessment["model_metadata"], "observations": assessment["signals"]}
-    inserted = await db.execute(text("""
-        INSERT INTO risk_assessments (
-            raw_cms_record_id, payment_date, risk_score, risk_level, review_recommended,
-            model_version, plain_language_explanation, evidence, is_current
-        ) VALUES (
-            :record_id, :payment_date, :risk_score, :risk_level, :review_recommended,
-            :model_version, :plain_language_explanation, CAST(:evidence AS jsonb), TRUE
-        ) RETURNING id
-    """), {
-        "record_id": payment["raw_cms_record_id"], "payment_date": payment["payment_date"],
-        "risk_score": assessment["risk_score"], "risk_level": assessment["risk_level"],
-        "review_recommended": assessment["review_recommended"], "model_version": MODEL_VERSION,
-        "plain_language_explanation": assessment["plain_language_explanation"], "evidence": json.dumps(evidence),
-    })
-    assessment_id = inserted.scalar_one()
-    for observation in assessment["signals"]:
-        await db.execute(text("""
-            INSERT INTO risk_signals (assessment_id, code, weight, title, plain_explanation, evidence)
-            VALUES (:assessment_id, :code, :weight, :title, :plain_explanation, CAST(:evidence AS jsonb))
-        """), {**observation, "assessment_id": assessment_id, "evidence": json.dumps(observation["evidence"])})
+async def _load_all_payments(db: AsyncIOMotorDatabase) -> list[dict[str, Any]]:
+    cursor = db["cms_payments"].find({}, {**PAYMENT_FEATURE_PROJECTION, "_id": 1}).sort([("payment_date", 1), ("raw_cms_record_id", 1)])
+    return [from_bson(row) for row in await cursor.to_list(length=None)]
 
 
-async def run_isolation_forest_triage(db: AsyncSession) -> dict[str, int | str]:
+def _assessment_document(payment: dict[str, Any], assessment: dict[str, Any]) -> dict[str, Any]:
+    """One ``risk_assessments`` document with its signals embedded."""
+    return RiskAssessment(
+        raw_cms_record_id=payment["raw_cms_record_id"],
+        payment_date=payment["payment_date"],
+        risk_score=assessment["risk_score"],
+        risk_level=assessment["risk_level"],
+        review_recommended=assessment["review_recommended"],
+        model_version=MODEL_VERSION,
+        plain_language_explanation=assessment["plain_language_explanation"],
+        evidence={"model": assessment["model_metadata"], "observations": assessment["signals"]},
+        risk_signals=[RiskSignal(**observation) for observation in assessment["signals"]],
+        is_current=True,
+    ).model_dump(by_alias=True, exclude={"id", "revision_id"}, exclude_none=False)
+
+
+async def run_isolation_forest_triage(db: AsyncIOMotorDatabase) -> dict[str, int | str]:
     """Fit the model to the current dataset and persist its complete batch output."""
     import asyncio
+    from datetime import datetime, timezone
+
     payments = await _load_all_payments(db)
-    # FIX: score_payments trains a scikit-learn IsolationForest — pure CPU work.
-    # Running it directly blocks the async event loop for the full training
-    # duration (proportional to dataset size). Offload to a thread pool so
-    # other API requests can proceed while the model trains.
+    # score_payments trains a scikit-learn IsolationForest — pure CPU work.
+    # Offload to a thread pool so other API requests can proceed meanwhile.
     loop = asyncio.get_running_loop()
     assessments = await loop.run_in_executor(None, score_payments, payments)
     # Support an explicit re-run after a model-version change as well as the
     # normal ingestion lifecycle, which performs this invalidation first.
-    await db.execute(text("""
-        UPDATE risk_assessments
-        SET is_current = FALSE, invalidated_at = NOW()
-        WHERE is_current = TRUE
-    """))
-    for payment, assessment in zip(payments, assessments, strict=True):
-        await _store_assessment(db, payment, assessment)
+    collection = db["risk_assessments"]
+    await collection.update_many(
+        {"is_current": True},
+        {"$set": {"is_current": False, "invalidated_at": datetime.now(timezone.utc)}},
+    )
+    documents = [
+        _assessment_document(payment, assessment)
+        for payment, assessment in zip(payments, assessments, strict=True)
+    ]
+    if documents:
+        await collection.insert_many(documents, ordered=False)
+        # Embed the current score on each payment so queue reads need no join.
+        await db["cms_payments"].bulk_write([
+            UpdateOne(
+                {"_id": payment["_id"]},
+                {"$set": {"current_risk_score": assessment["risk_score"], "current_risk_model_version": MODEL_VERSION}},
+            )
+            for payment, assessment in zip(payments, assessments, strict=True)
+        ], ordered=False)
     return {
         "records_scored": len(assessments),
         "records_flagged": sum(item["review_recommended"] for item in assessments),
@@ -246,7 +246,7 @@ async def run_isolation_forest_triage(db: AsyncSession) -> dict[str, int | str]:
     }
 
 
-async def assess_payment(db: AsyncSession, record_id: str, payment_date: Any) -> dict[str, Any] | None:
+async def assess_payment(db: AsyncIOMotorDatabase, record_id: str, payment_date: Any) -> dict[str, Any] | None:
     """Read the current batch result; build the batch if no current result exists."""
     payment = await _load_payment(db, record_id, payment_date)
     if payment is None:
@@ -258,27 +258,17 @@ async def assess_payment(db: AsyncSession, record_id: str, payment_date: Any) ->
     return {**current, "payment": payment} if current else None
 
 
-async def get_current_assessment(db: AsyncSession, record_id: str, payment_date: Any) -> dict[str, Any] | None:
+async def get_current_assessment(db: AsyncIOMotorDatabase, record_id: str, payment_date: Any) -> dict[str, Any] | None:
     """Retrieve the current model result; stale history is never returned."""
-    result = await db.execute(text("""
-        SELECT id, risk_score, risk_level, review_recommended, model_version,
-               plain_language_explanation, evidence, assessed_at
-        FROM risk_assessments
-        WHERE raw_cms_record_id = :record_id
-          AND payment_date::date = :payment_date
-          AND is_current = TRUE
-          AND model_version = :model_version
-        ORDER BY assessed_at DESC
-        LIMIT 1
-    """), {"record_id": record_id, "payment_date": payment_date, "model_version": MODEL_VERSION})
-    row = result.mappings().one_or_none()
+    row = await db["risk_assessments"].find_one(
+        {**payment_day_filter(record_id, payment_date), "is_current": True, "model_version": MODEL_VERSION},
+        sort=[("assessed_at", -1)],
+    )
     if row is None:
         return None
-    evidence = row["evidence"]
-    if isinstance(evidence, str):
-        evidence = json.loads(evidence)
+    evidence = row.get("evidence") or {}
     return {
-        "assessment_id": row["id"], "risk_score": row["risk_score"],
+        "assessment_id": str(row["_id"]), "risk_score": row["risk_score"],
         "risk_level": row["risk_level"], "review_recommended": row["review_recommended"],
         "model_version": row["model_version"],
         "plain_language_explanation": row["plain_language_explanation"],

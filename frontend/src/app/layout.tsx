@@ -6,7 +6,7 @@ import './globals.css';
 export const metadata: Metadata = {
   title: 'FalsePay — AI Sunshine Dispute Advocate',
   description:
-    'HCP Outbound Engagement Engine: CMS Open Payments Audit & Defense Guard powered by Tiger Data, TimescaleDB, and pgvector.',
+    'HCP Outbound Engagement Engine: CMS Open Payments Audit & Defense Guard powered by MongoDB Atlas and Atlas Vector Search.',
   robots: 'noindex',
 };
 

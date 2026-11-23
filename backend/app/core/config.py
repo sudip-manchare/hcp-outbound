@@ -8,9 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # Tiger Data / PostgreSQL
-    DATABASE_URL: str = "postgresql+asyncpg://localhost/hcp_outbound"
-    DATABASE_URL_SYNC: str = "postgresql://localhost/hcp_outbound"
+    # MongoDB Atlas
+    MONGODB_URI: str = "mongodb://localhost:27017"
+    MONGODB_DB_NAME: str = "hcp_outbound"
 
     # App
     APP_ENV: str = "development"
